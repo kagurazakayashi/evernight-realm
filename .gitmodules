@@ -1,0 +1,3 @@
+[submodule "evernight-realm-app"]
+	path = evernight-realm-app
+	url = git@github.com:kagurazakayashi/evernight-realm-app.git

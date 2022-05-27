@@ -1,0 +1,33 @@
+# Evernight Realm 服務端配置示例（脫敏模板）
+#
+# 使用方法：複製本檔案為執行資料目錄中的 config.yaml 後按需修改。
+# 本檔案不含任何真實憑據；真實金鑰與配置只存在於 evernight-data/config.yaml，
+# 該目錄已被 .gitignore 排除，不會進入版本庫。
+#
+# 注意：以下鍵為規劃結構，隨開發步驟逐步落地；未實現的鍵將被忽略。
+
+# ---- 伺服器 ----
+server:
+  listen: "127.0.0.1:3080"          # HTTP 監聽地址；區域網部署時改為主機區域網 IP
+  data_dir: "."                     # 執行資料目錄（預設 evernight-data/）
+  display_timezone: "Asia/Shanghai" # 伺服器顯示時區；資料庫仍以 UTC 儲存
+
+# ---- 資料庫 ----
+database:
+  path: "evernight.db"              # SQLite 檔案（相對 data_dir）
+  busy_timeout_ms: 5000             # 鎖等待超時
+
+# ---- 儲存目錄 ----
+media: "media/"                     # 媒體檔案
+documents: "documents/"             # 文件
+attachments: "attachments/"         # 附件
+backups: "backups/"                 # 備份
+
+# ---- 日誌 ----
+logs:
+  dir: "logs/"
+  level: "info"                     # debug | info | warn | error
+
+# ---- 安全（部署者自行生成，勿在此提交真實值） ----
+security:
+  session_ttl_hours: 24

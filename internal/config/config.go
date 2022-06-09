@@ -9,6 +9,7 @@ package config
 
 import (
 	"errors"
+	"flag"
 	"fmt"
 	"net"
 	"os"
@@ -93,22 +94,40 @@ func Default() Config {
 	}
 }
 
-// Load 依序以預設值、config.yaml、環境變數建構組態並校驗。
+// ParseArgs 解析命令列參數，目前支援 --data-dir；未知參數回傳錯誤。
+func ParseArgs(args []string) (Options, error) {
+	var opts Options
+	fs := flag.NewFlagSet("evernight-server", flag.ContinueOnError)
+	fs.SetOutput(os.Stderr)
+	fs.StringVar(&opts.DataDir, "data-dir", "", "執行資料目錄（預設 evernight-data/）")
+	if err := fs.Parse(args); err != nil {
+		return Options{}, fmt.Errorf("命令列參數錯誤: %w", err)
+	}
+	if fs.NArg() > 0 {
+		return Options{}, fmt.Errorf("命令列參數錯誤: 不認識的位置參數 %q", fs.Arg(0))
+	}
+	return opts, nil
+}
+
+// Load 依序以預設值、config.yaml、環境變數、命令列建構組態並校驗。
 //
 // config.yaml 的位置由 opts.ConfigPath 決定；未指定時以
 // {opts.DataDir 或預設 evernight-data}/config.yaml 為準。
 // 組態檔不存在時以預設值執行（首次啟動時建立範例組態）。
+// 優先序：命令列 --data-dir > 環境變數 > config.yaml > 預設值。
 func Load(opts Options) (Config, error) {
 	cfg := Default()
 
-	dataDir := opts.DataDir
-	if dataDir == "" {
-		dataDir = cfg.Server.DataDir
+	// 組態檔位置由外部指定或預設資料目錄決定；
+	// yaml 內部的 data_dir 不影響組態檔讀取位置（避免循環依賴）。
+	configDir := opts.DataDir
+	if configDir == "" {
+		configDir = Default().Server.DataDir
 	}
 
 	configPath := opts.ConfigPath
 	if configPath == "" {
-		configPath = filepath.Join(dataDir, "config.yaml")
+		configPath = filepath.Join(configDir, "config.yaml")
 	}
 
 	if data, err := os.ReadFile(configPath); err == nil {
@@ -121,6 +140,11 @@ func Load(opts Options) (Config, error) {
 
 	if err := applyEnv(&cfg); err != nil {
 		return Config{}, err
+	}
+
+	// 命令列 --data-dir 優先於環境變數與 yaml。
+	if opts.DataDir != "" {
+		cfg.Server.DataDir = opts.DataDir
 	}
 
 	// "." 或空 data_dir 表示採用預設資料目錄（與 config.example.yaml 語意一致）。
@@ -263,6 +287,119 @@ func applyEnv(cfg *Config) error {
 				return fmt.Errorf("config: 環境變數 %s 需為整數，實際為 %q", f.env, v)
 			}
 			*f.dst = n
+		}
+	}
+	return nil
+}
+
+// ExampleYAML 為首次啟動時寫入資料目錄的脫敏範例組態（不含任何真實憑據）。
+const ExampleYAML = `# Evernight Realm 服務端組態（首次啟動自動建立）
+#
+# 本檔案不含真實憑據；root_password_hash 若未設定，系統將於初始化流程產生。
+# 修改後重啟服務端生效。
+
+server:
+  listen: "127.0.0.1:3080"          # HTTP 監聽地址；區域網部署時改為主機區域網 IP
+  data_dir: "."                     # 執行資料目錄（預設 evernight-data/）
+  display_timezone: "Asia/Shanghai" # 伺服器顯示時區；資料庫仍以 UTC 儲存
+
+database:
+  path: "evernight.db"              # SQLite 檔案（相對 data_dir）
+  busy_timeout_ms: 5000              # 鎖等待超時
+
+media: "media/"                     # 媒體檔案
+# documents / attachments / backups 與 media 同理，省略時沿用預設。
+
+logs:
+  dir: "logs/"
+  level: "info"                     # debug | info | warn | error
+
+security:
+  session_ttl_hours: 24
+`
+
+// Resolve 將所有相對路徑欄位解析為資料目錄下的絕對路徑並清除冗餘片段。
+// 相對路徑不得逃出資料目錄（拒絕路徑穿越）；絕對路徑原樣保留。
+// 含空格與非 ASCII 字元的路徑由 Go 字串原生支援，不需額外處理。
+func (c *Config) Resolve() error {
+	absDir, err := filepath.Abs(c.Server.DataDir)
+	if err != nil {
+		return fmt.Errorf("config: 解析資料目錄 %q 失敗: %w", c.Server.DataDir, err)
+	}
+	dataDir := filepath.Clean(absDir)
+	c.Server.DataDir = dataDir
+
+	type field struct {
+		dst  *string
+		name string
+	}
+	fields := []field{
+		{&c.Database.Path, "database.path"},
+		{&c.Media, "media"},
+		{&c.Documents, "documents"},
+		{&c.Attachments, "attachments"},
+		{&c.Backups, "backups"},
+		{&c.Logs.Dir, "logs.dir"},
+	}
+	for _, f := range fields {
+		resolved, err := joinWithin(dataDir, *f.dst)
+		if err != nil {
+			return fmt.Errorf("config: %s %v", f.name, err)
+		}
+		*f.dst = resolved
+	}
+	return nil
+}
+
+// joinWithin 將相對路徑解析於 base 內；絕對路徑保留。
+func joinWithin(base, p string) (string, error) {
+	if p == "" {
+		return "", errors.New("不可為空")
+	}
+	if filepath.IsAbs(p) {
+		return filepath.Clean(p), nil
+	}
+	resolved := filepath.Clean(filepath.Join(base, p))
+	rel, err := filepath.Rel(base, resolved)
+	if err != nil {
+		return "", fmt.Errorf("解析失敗: %w", err)
+	}
+	if rel == ".." || strings.HasPrefix(rel, ".."+string(os.PathSeparator)) {
+		return "", fmt.Errorf("路徑穿越拒絕: %q", p)
+	}
+	return resolved, nil
+}
+
+// Prepare 建立資料目錄與子目錄、探測可寫性，並在缺少組態檔時寫入範例組態。
+// 重複執行（重複啟動）為冪等操作。
+func (c *Config) Prepare() error {
+	dirs := []string{
+		c.Server.DataDir,
+		c.Media,
+		c.Documents,
+		c.Attachments,
+		c.Backups,
+		c.Logs.Dir,
+	}
+	for _, d := range dirs {
+		if err := os.MkdirAll(d, 0o750); err != nil {
+			return fmt.Errorf("config: 建立目錄 %s 失敗: %w", d, err)
+		}
+	}
+
+	// 可寫性探測：寫入後立即刪除，確保資料目錄實際可寫（SYS-010）。
+	probe := filepath.Join(c.Server.DataDir, ".write-probe")
+	if err := os.WriteFile(probe, []byte("ok"), 0o600); err != nil {
+		return fmt.Errorf("config: 資料目錄 %s 不可寫: %w", c.Server.DataDir, err)
+	}
+	if err := os.Remove(probe); err != nil {
+		return fmt.Errorf("config: 資料目錄清理失敗: %w", err)
+	}
+
+	configPath := filepath.Join(c.Server.DataDir, "config.yaml")
+	if _, err := os.Stat(configPath); errors.Is(err, os.ErrNotExist) {
+		if err := os.WriteFile(configPath, []byte(ExampleYAML), 0o600); err != nil {
+			return fmt.Errorf("config: 建立範例組態 %s 失敗: %w", configPath, err)
 		}
 	}
 	return nil

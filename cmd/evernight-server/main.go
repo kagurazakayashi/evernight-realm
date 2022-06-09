@@ -14,7 +14,7 @@ import (
 
 // main 為程式進入點：以 app.Run 的回傳錯誤決定結束碼。
 func main() {
-	if err := app.Run(); err != nil {
+	if err := app.Run(os.Args[1:]); err != nil {
 		fmt.Fprintln(os.Stderr, err)
 		os.Exit(1)
 	}

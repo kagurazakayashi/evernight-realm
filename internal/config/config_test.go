@@ -196,3 +196,107 @@ func TestListenAllInterfaces(t *testing.T) {
 		t.Error("127.0.0.1 不應判定為暴露所有介面")
 	}
 }
+
+func TestResolvePathsWithSpacesAndNonASCII(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "活動 資料 目录")
+	cfg := Default()
+	cfg.Server.DataDir = dir
+	if err := cfg.Resolve(); err != nil {
+		t.Fatalf("Resolve 失敗（空格/非 ASCII 路徑）: %v", err)
+	}
+	if !filepath.IsAbs(cfg.Database.Path) {
+		t.Errorf("database.path 應解析為絕對路徑: %q", cfg.Database.Path)
+	}
+	if !strings.Contains(cfg.Database.Path, dir) {
+		t.Errorf("database.path 應位於資料目錄內: %q", cfg.Database.Path)
+	}
+	if cfg.Media != filepath.Join(dir, "media") {
+		t.Errorf("media 解析錯誤: %q", cfg.Media)
+	}
+}
+
+func TestResolveKeepsAbsolutePaths(t *testing.T) {
+	cfg := Default()
+	cfg.Server.DataDir = filepath.Join(t.TempDir(), "data")
+	cfg.Database.Path = "D:/external/evernight.db"
+	cfg.Media = "/opt/media"
+	if err := cfg.Resolve(); err != nil {
+		t.Fatalf("Resolve 失敗: %v", err)
+	}
+	if !filepath.IsAbs(cfg.Database.Path) || !filepath.IsAbs(cfg.Media) {
+		t.Error("絕對路徑應原樣保留")
+	}
+}
+
+func TestResolveRejectsTraversal(t *testing.T) {
+	cfg := Default()
+	cfg.Server.DataDir = t.TempDir()
+	cfg.Media = "../../../escape"
+	err := cfg.Resolve()
+	if err == nil || !strings.Contains(err.Error(), "路徑穿越拒絕") {
+		t.Errorf("相對路徑穿越應被拒絕，實際: %v", err)
+	}
+}
+
+func TestPrepareCreatesDirsAndExampleConfig(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "evernight-data 測試")
+	cfg := Default()
+	cfg.Server.DataDir = dir
+	if err := cfg.Resolve(); err != nil {
+		t.Fatalf("Resolve 失敗: %v", err)
+	}
+	if err := cfg.Prepare(); err != nil {
+		t.Fatalf("Prepare 失敗: %v", err)
+	}
+	for _, d := range []string{cfg.Media, cfg.Documents, cfg.Attachments, cfg.Backups, cfg.Logs.Dir} {
+		fi, err := os.Stat(d)
+		if err != nil || !fi.IsDir() {
+			t.Errorf("子目錄未建立: %s (%v)", d, err)
+		}
+	}
+	configPath := filepath.Join(dir, "config.yaml")
+	data, err := os.ReadFile(configPath)
+	if err != nil {
+		t.Fatalf("範例組態未建立: %v", err)
+	}
+	if !strings.Contains(string(data), "listen") {
+		t.Error("範例組態內容不完整")
+	}
+
+	// 冪等：重複 Prepare 不報錯、不覆蓋已修改的組態
+	modified := []byte("# 使用者修改\nserver:\n  listen: \"127.0.0.1:9999\"\n")
+	if err := os.WriteFile(configPath, modified, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := cfg.Prepare(); err != nil {
+		t.Fatalf("重複 Prepare 應冪等: %v", err)
+	}
+	after, _ := os.ReadFile(configPath)
+	if string(after) != string(modified) {
+		t.Error("重複 Prepare 不應覆蓋使用者組態")
+	}
+}
+
+func TestParseArgs(t *testing.T) {
+	opts, err := ParseArgs([]string{"--data-dir", "D:/my data/er"})
+	if err != nil || opts.DataDir != "D:/my data/er" {
+		t.Errorf("--data-dir 解析失敗: opts=%+v err=%v", opts, err)
+	}
+	if _, err := ParseArgs([]string{"--nope"}); err == nil {
+		t.Error("未知參數應報錯")
+	}
+	if _, err := ParseArgs([]string{"extra"}); err == nil {
+		t.Error("位置參數應報錯")
+	}
+}
+
+func TestLoadCommandLineOverridesYAML(t *testing.T) {
+	p := writeConfig(t, "server:\n  data_dir: \"yaml-dir\"\n")
+	cfg, err := Load(Options{ConfigPath: p, DataDir: "cli-dir"})
+	if err != nil {
+		t.Fatalf("Load 失敗: %v", err)
+	}
+	if cfg.Server.DataDir != "cli-dir" {
+		t.Errorf("命令列 --data-dir 應優先於 yaml: %q", cfg.Server.DataDir)
+	}
+}

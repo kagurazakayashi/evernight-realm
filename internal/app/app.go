@@ -13,12 +13,22 @@ import (
 // Version 為目前開發版本。正式版號策略待發布流程定案後統一管理。
 const Version = "0.1.0-dev"
 
-// Run 啟動服務端。目前流程：載入並校驗組態 → 輸出脫敏摘要與監聽提示。
-// 後續步驟將在此加入：資料目錄初始化、HTTP 服務與存活檢查等。
-// 組態非法時回傳錯誤（含欄位路徑，不含機密），由 main 決定結束碼。
-func Run() error {
-	cfg, err := config.Load(config.Options{})
+// Run 啟動服務端。流程：解析命令列 → 載入並校驗組態 → 路徑規範化
+// → 資料目錄初始化（建目錄/可寫性探測/範例組態）→ 輸出脫敏摘要與監聽提示。
+// 組態非法或目錄不可用時回傳錯誤（含欄位路徑，不含機密），由 main 決定結束碼。
+func Run(args []string) error {
+	opts, err := config.ParseArgs(args)
 	if err != nil {
+		return err
+	}
+	cfg, err := config.Load(opts)
+	if err != nil {
+		return err
+	}
+	if err := cfg.Resolve(); err != nil {
+		return err
+	}
+	if err := cfg.Prepare(); err != nil {
 		return err
 	}
 

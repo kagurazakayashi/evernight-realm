@@ -1,4 +1,4 @@
-// 驗證瀏覽器 JS 環境（Node 模擬）解析 UUIDv7 與大整數字串（STEP-025 探針）。
+// 驗證瀏覽器 JS 環境（Node 模擬）解析 UUIDv7 與大整數字串（探針原型）。
 //
 // 用法：node check.js <樣例.json 路徑>
 // 以 BigInt 解析金額字串；以正規式校驗 UUIDv7。

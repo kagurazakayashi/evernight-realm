@@ -1,4 +1,4 @@
-// 驗證 Web 在 HTTP 局域網及 HTTPS 下的掃碼可用條件（STEP-026 探針，可丟棄原型）。
+// 驗證 Web 在 HTTP 局域網及 HTTPS 下的掃碼可用條件（探針原型，可丟棄）。
 //
 // 啟動本機 HTTP 服務（綁定 0.0.0.0），提供測試頁：
 //   - 輸出 isSecureContext / navigator.mediaDevices / getUserMedia 存在性
@@ -42,5 +42,5 @@ const server = http.createServer((req, res) => {
   res.end(page);
 });
 server.listen(8012, '0.0.0.0', () => {
-  console.log('STEP-026 scan-context-test listening on :8012');
+  console.log('scan-context-test listening on :8012');
 });

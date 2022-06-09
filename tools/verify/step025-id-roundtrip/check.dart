@@ -1,4 +1,4 @@
-// 驗證 Dart（Flutter Web 執行環境）解析 UUIDv7 與大整數字串（STEP-025 探針）。
+// 驗證 Dart（Flutter Web 執行環境）解析 UUIDv7 與大整數字串（探針原型）。
 //
 // 用法：dart run check.dart <樣例.json 路徑>
 // 以 BigInt 解析金額字串並與期望值比對；以正規式校驗 UUIDv7 格式。

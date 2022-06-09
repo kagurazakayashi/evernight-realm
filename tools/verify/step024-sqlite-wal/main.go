@@ -1,4 +1,4 @@
-// 驗證 modernc.org/sqlite 在 Windows 上的事務與 WAL 行為（STEP-024 探針，可丟棄原型）。
+// 驗證 modernc.org/sqlite 在 Windows 上的事務與 WAL 行為（探針原型，可丟棄）。
 //
 // 驗證場景：
 //  1. WAL 模式生效（journal_mode=wal 且生成 -wal 檔案）。
@@ -42,7 +42,7 @@ func main() {
 	defer os.RemoveAll(dir)
 
 	dbPath := filepath.Join(dir, "verify.db")
-	fmt.Printf("== STEP-024 SQLite WAL/事務驗證 ==\n資料庫: %s\n\n", dbPath)
+	fmt.Printf("== SQLite WAL/事務驗證 ==\n資料庫: %s\n\n", dbPath)
 
 	// 場景 1：WAL 模式
 	dsn := "file:" + filepath.ToSlash(dbPath) + "?_pragma=journal_mode(WAL)&_pragma=foreign_keys(1)"

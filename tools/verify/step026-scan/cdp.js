@@ -1,4 +1,4 @@
-// STEP-026 輔助：透過 CDP 取得 headless Chrome 中測試頁的執行結果。
+// 輔助：透過 CDP 取得 headless Chrome 中測試頁的執行結果。
 // 用法：先啟動 chrome --headless=new --remote-debugging-port=9222 about:blank，
 //       再執行 node cdp.js <目標 URL>。
 'use strict';

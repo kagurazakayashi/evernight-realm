@@ -43,7 +43,7 @@ type Config struct {
 
 // ServerConfig 為伺服器層組態。
 type ServerConfig struct {
-	Listen          string `yaml:"listen"`           // HTTP 監聽地址，預設 127.0.0.1:3080
+	Listen          string `yaml:"listen"`           // HTTP 監聽地址，預設 127.0.0.1:5206
 	DataDir         string `yaml:"data_dir"`         // 執行資料目錄；"." 或空表示預設 evernight-data
 	DisplayTimezone string `yaml:"display_timezone"` // 顯示時區（IANA 名稱）；資料庫仍以 UTC 儲存
 }
@@ -72,7 +72,7 @@ type SecurityConfig struct {
 func Default() Config {
 	return Config{
 		Server: ServerConfig{
-			Listen:          "127.0.0.1:3080",
+			Listen:          "127.0.0.1:5206",
 			DataDir:         "evernight-data",
 			DisplayTimezone: "Asia/Shanghai",
 		},
@@ -165,7 +165,7 @@ func (c *Config) Validate() error {
 	}
 	host, port, err := net.SplitHostPort(c.Server.Listen)
 	if err != nil {
-		return fmt.Errorf("config: server.listen 格式無效（需 host:port，如 127.0.0.1:3080）: %q", c.Server.Listen)
+		return fmt.Errorf("config: server.listen 格式無效（需 host:port，如 127.0.0.1:5206）: %q", c.Server.Listen)
 	}
 	if host == "" {
 		return errors.New("config: server.listen 缺少主機（禁止裸埠監聽）")
@@ -299,7 +299,7 @@ const ExampleYAML = `# Evernight Realm 服務端組態（首次啟動自動建�
 # 修改後重啟服務端生效。
 
 server:
-  listen: "127.0.0.1:3080"          # HTTP 監聽地址；區域網部署時改為主機區域網 IP
+  listen: "127.0.0.1:5206"          # HTTP 監聽地址；區域網部署時改為主機區域網 IP
   data_dir: "."                     # 執行資料目錄（預設 evernight-data/）
   display_timezone: "Asia/Shanghai" # 伺服器顯示時區；資料庫仍以 UTC 儲存
 

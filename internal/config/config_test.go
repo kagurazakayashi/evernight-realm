@@ -24,7 +24,7 @@ func TestLoadDefaults(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Load 失敗: %v", err)
 	}
-	if cfg.Server.Listen != "127.0.0.1:3080" {
+	if cfg.Server.Listen != "127.0.0.1:5206" {
 		t.Errorf("預設 listen 錯誤: %q", cfg.Server.Listen)
 	}
 	if cfg.Server.DataDir != "evernight-data" {
@@ -82,7 +82,7 @@ func TestLoadDataDirDotMeansDefault(t *testing.T) {
 }
 
 func TestLoadEnvOverridesYAML(t *testing.T) {
-	p := writeConfig(t, "server:\n  listen: \"127.0.0.1:3080\"\n")
+	p := writeConfig(t, "server:\n  listen: \"127.0.0.1:5206\"\n")
 	t.Setenv("ER_SERVER_LISTEN", "127.0.0.1:9090")
 	cfg, err := Load(Options{ConfigPath: p})
 	if err != nil {
@@ -108,7 +108,7 @@ func TestValidateBadListen(t *testing.T) {
 	}{
 		{"", "server.listen 不可為空"},
 		{"localhost", "格式無效"},
-		{":3080", "缺少主機"},
+		{":5206", "缺少主機"},
 		{"127.0.0.1:99999", "連接埠無效"},
 		{"127.0.0.1:0", "連接埠無效"},
 	}
@@ -187,11 +187,11 @@ func TestRedactedNeverLeaksSecret(t *testing.T) {
 
 func TestListenAllInterfaces(t *testing.T) {
 	cfg := Default()
-	cfg.Server.Listen = "0.0.0.0:3080"
+	cfg.Server.Listen = "0.0.0.0:5206"
 	if !cfg.ListenAllInterfaces() {
 		t.Error("0.0.0.0 應判定為暴露所有介面")
 	}
-	cfg.Server.Listen = "127.0.0.1:3080"
+	cfg.Server.Listen = "127.0.0.1:5206"
 	if cfg.ListenAllInterfaces() {
 		t.Error("127.0.0.1 不應判定為暴露所有介面")
 	}

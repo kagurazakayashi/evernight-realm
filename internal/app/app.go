@@ -8,6 +8,7 @@ import (
 	"fmt"
 
 	"github.com/kagurazakayashi/evernight-realm/internal/config"
+	"github.com/kagurazakayashi/evernight-realm/internal/httpapi"
 )
 
 // Version 為目前開發版本。正式版號策略待發布流程定案後統一管理。
@@ -38,5 +39,10 @@ func Run(args []string) error {
 	if cfg.ListenAllInterfaces() {
 		fmt.Println("風險提示：監聽地址暴露於所有介面（含公網網卡），請確認防火牆與部署範圍。")
 	}
-	return nil
+
+	// HTTP 服務：提供 /health 存活檢查；阻塞至錯誤發生。
+	// 優雅停止與後台任務取消於後續步驟加入。
+	srv := httpapi.New(&cfg, Version)
+	fmt.Printf("HTTP 服務已啟動：http://%s （/health 為存活檢查）\n", cfg.Server.Listen)
+	return srv.ListenAndServe()
 }

@@ -8,7 +8,7 @@
 
 # ---- 伺服器 ----
 server:
-  listen: "127.0.0.1:3080"          # HTTP 監聽地址；區域網部署時改為主機區域網 IP
+  listen: "127.0.0.1:5206"          # HTTP 監聽地址；區域網部署時改為主機區域網 IP
   data_dir: "."                     # 執行資料目錄（預設 evernight-data/）
   display_timezone: "Asia/Shanghai" # 伺服器顯示時區；資料庫仍以 UTC 儲存
 

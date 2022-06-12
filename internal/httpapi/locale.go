@@ -42,6 +42,30 @@ var errorMessages = map[ErrorCode]map[string]string{
 		LocaleEnUS: "The request method is not allowed.",
 		LocaleJaJP: "このリクエストメソッドは許可されていません。",
 	},
+	CodePayloadTooLarge: {
+		LocaleZhCN: "请求内容过大，超出服务器允许的上限。",
+		LocaleZhTW: "請求內容過大，超出伺服器允許的上限。",
+		LocaleEnUS: "The request body is too large and was rejected.",
+		LocaleJaJP: "リクエスト本文が大きすぎるため、受け付けられませんでした。",
+	},
+	CodeInvalidBody: {
+		LocaleZhCN: "请求内容格式不正确，请检查后重试。",
+		LocaleZhTW: "請求內容格式不正確，請檢查後重試。",
+		LocaleEnUS: "The request body is malformed or contains unsupported fields.",
+		LocaleJaJP: "リクエスト本文の形式が正しくないか、未対応の項目が含まれています。",
+	},
+	CodeUnsupportedMediaType: {
+		LocaleZhCN: "请求内容类型不受支持，请使用 application/json。",
+		LocaleZhTW: "請求內容型別不受支援，請使用 application/json。",
+		LocaleEnUS: "Unsupported request content type. Use application/json.",
+		LocaleJaJP: "リクエストの Content-Type に対応していません。application/json を使用してください。",
+	},
+	CodeRequestTimeout: {
+		LocaleZhCN: "服务器处理该请求超时，请稍后重试。",
+		LocaleZhTW: "伺服器處理該請求逾時，請稍後重試。",
+		LocaleEnUS: "The server timed out while processing the request. Please try again.",
+		LocaleJaJP: "サーバーがリクエストの処理中にタイムアウトしました。しばらくしてからお試しください。",
+	},
 }
 
 // messageFor 取得錯誤碼在指定語言的使用者訊息；語言未支援或訊息為空時回退 defaultLocale。

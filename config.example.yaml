@@ -12,6 +12,14 @@ server:
   data_dir: "."                     # 執行資料目錄（預設 evernight-data/）
   display_timezone: "Asia/Shanghai" # 伺服器顯示時區；資料庫仍以 UTC 儲存
 
+  # HTTP 層保護參數（單位：毫秒 / 位元組）；request 不得大於 write。
+  read_header_timeout_ms: 5000      # 標頭讀取逾時
+  read_timeout_ms: 15000            # 整個請求讀取逾時
+  write_timeout_ms: 30000           # 回應寫入逾時
+  idle_timeout_ms: 60000            # keep-alive 空閒逾時
+  request_timeout_ms: 10000         # 單次處理期限（超過回 503）
+  max_body_bytes: 1048576           # JSON 請求體上限（1 MiB）
+
 # ---- 資料庫 ----
 database:
   path: "evernight.db"              # SQLite 檔案（相對 data_dir）

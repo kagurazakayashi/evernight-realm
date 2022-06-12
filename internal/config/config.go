@@ -46,6 +46,16 @@ type ServerConfig struct {
 	Listen          string `yaml:"listen"`           // HTTP 監聽地址，預設 127.0.0.1:5206
 	DataDir         string `yaml:"data_dir"`         // 執行資料目錄；"." 或空表示預設 evernight-data
 	DisplayTimezone string `yaml:"display_timezone"` // 顯示時區（IANA 名稱）；資料庫仍以 UTC 儲存
+
+	// HTTP 層保護參數（STEP-034）：逾時單位為毫秒，請求體上限單位為位元組。
+	// 逾時分工：read_header 限制標頭讀取、read 限制整個請求讀取、
+	// write 限制回應寫入、request 為單次處理的處理器期限、idle 限制 keep-alive 空閒。
+	ReadHeaderTimeoutMS int   `yaml:"read_header_timeout_ms"`
+	ReadTimeoutMS       int   `yaml:"read_timeout_ms"`
+	WriteTimeoutMS      int   `yaml:"write_timeout_ms"`
+	IdleTimeoutMS       int   `yaml:"idle_timeout_ms"`
+	RequestTimeoutMS    int   `yaml:"request_timeout_ms"`
+	MaxBodyBytes        int64 `yaml:"max_body_bytes"` // JSON API 請求體上限；上傳路由日後單獨放寬
 }
 
 // DatabaseConfig 為 SQLite 資料庫組態。
@@ -72,9 +82,15 @@ type SecurityConfig struct {
 func Default() Config {
 	return Config{
 		Server: ServerConfig{
-			Listen:          "127.0.0.1:5206",
-			DataDir:         "evernight-data",
-			DisplayTimezone: "Asia/Shanghai",
+			Listen:              "127.0.0.1:5206",
+			DataDir:             "evernight-data",
+			DisplayTimezone:     "Asia/Shanghai",
+			ReadHeaderTimeoutMS: 5000,
+			ReadTimeoutMS:       15000,
+			WriteTimeoutMS:      30000,
+			IdleTimeoutMS:       60000,
+			RequestTimeoutMS:    10000,
+			MaxBodyBytes:        1 << 20,
 		},
 		Database: DatabaseConfig{
 			Path:          "evernight.db",
@@ -182,6 +198,32 @@ func (c *Config) Validate() error {
 		return fmt.Errorf("config: server.display_timezone 不是有效 IANA 時區: %q", c.Server.DisplayTimezone)
 	}
 
+	// HTTP 層保護參數：全部需為正數；處理期限不得長於回應寫入期限，
+	// 否則連線期限會先觸發，用戶端得到連線中斷而非穩定錯誤碼。
+	timeouts := []struct {
+		name  string
+		value int
+	}{
+		{"server.read_header_timeout_ms", c.Server.ReadHeaderTimeoutMS},
+		{"server.read_timeout_ms", c.Server.ReadTimeoutMS},
+		{"server.write_timeout_ms", c.Server.WriteTimeoutMS},
+		{"server.idle_timeout_ms", c.Server.IdleTimeoutMS},
+		{"server.request_timeout_ms", c.Server.RequestTimeoutMS},
+	}
+	for _, t := range timeouts {
+		if t.value < 1 {
+			return fmt.Errorf("config: %s 必須為正整數（毫秒）", t.name)
+		}
+	}
+	if c.Server.RequestTimeoutMS > c.Server.WriteTimeoutMS {
+		return fmt.Errorf("config: server.request_timeout_ms（%d）不得大於 server.write_timeout_ms（%d）",
+			c.Server.RequestTimeoutMS, c.Server.WriteTimeoutMS)
+	}
+	if c.Server.MaxBodyBytes < minBodyBytes || c.Server.MaxBodyBytes > maxBodyBytes {
+		return fmt.Errorf("config: server.max_body_bytes 需介於 %d 與 %d 之間（位元組），實際為 %d",
+			minBodyBytes, maxBodyBytes, c.Server.MaxBodyBytes)
+	}
+
 	if c.Database.Path == "" {
 		return errors.New("config: database.path 不可為空")
 	}
@@ -218,6 +260,12 @@ func (c *Config) Validate() error {
 	return nil
 }
 
+// 請求體上限的合理區間：過小會使正常 JSON 請求失效，過大則失去保護意義。
+const (
+	minBodyBytes int64 = 1 << 10  // 1 KiB
+	maxBodyBytes int64 = 64 << 20 // 64 MiB
+)
+
 // ListenAllInterfaces 回傳 true 表示監聽地址暴露於所有介面（含公網網卡），
 // 供啟動日誌輸出風險提示。
 func (c Config) ListenAllInterfaces() bool {
@@ -230,12 +278,14 @@ func (c Config) ListenAllInterfaces() bool {
 
 // Redacted 回傳組態的脫敏摘要（供啟動日誌），機密欄位一律顯示 [REDACTED]。
 func (c Config) Redacted() string {
-	return fmt.Sprintf("組態摘要：listen=%s data_dir=%s timezone=%s db=%s busy_timeout_ms=%d media=%s documents=%s attachments=%s backups=%s logs_dir=%s logs_level=%s session_ttl_hours=%d root_password_hash=%s",
+	return fmt.Sprintf("組態摘要：listen=%s data_dir=%s timezone=%s db=%s busy_timeout_ms=%d media=%s documents=%s attachments=%s backups=%s logs_dir=%s logs_level=%s session_ttl_hours=%d root_password_hash=%s http_timeouts_ms=[read_header=%d read=%d write=%d idle=%d request=%d] max_body_bytes=%d",
 		c.Server.Listen, c.Server.DataDir, c.Server.DisplayTimezone,
 		c.Database.Path, c.Database.BusyTimeoutMS,
 		c.Media, c.Documents, c.Attachments, c.Backups,
 		c.Logs.Dir, c.Logs.Level,
-		c.Security.SessionTTLHours, redact(c.Security.RootPasswordHash))
+		c.Security.SessionTTLHours, redact(c.Security.RootPasswordHash),
+		c.Server.ReadHeaderTimeoutMS, c.Server.ReadTimeoutMS, c.Server.WriteTimeoutMS,
+		c.Server.IdleTimeoutMS, c.Server.RequestTimeoutMS, c.Server.MaxBodyBytes)
 }
 
 func redact(s string) string {
@@ -279,6 +329,11 @@ func applyEnv(cfg *Config) error {
 	ints := []intField{
 		{&cfg.Database.BusyTimeoutMS, "ER_DATABASE_BUSY_TIMEOUT_MS"},
 		{&cfg.Security.SessionTTLHours, "ER_SECURITY_SESSION_TTL_HOURS"},
+		{&cfg.Server.ReadHeaderTimeoutMS, "ER_SERVER_READ_HEADER_TIMEOUT_MS"},
+		{&cfg.Server.ReadTimeoutMS, "ER_SERVER_READ_TIMEOUT_MS"},
+		{&cfg.Server.WriteTimeoutMS, "ER_SERVER_WRITE_TIMEOUT_MS"},
+		{&cfg.Server.IdleTimeoutMS, "ER_SERVER_IDLE_TIMEOUT_MS"},
+		{&cfg.Server.RequestTimeoutMS, "ER_SERVER_REQUEST_TIMEOUT_MS"},
 	}
 	for _, f := range ints {
 		if v := os.Getenv(f.env); v != "" {
@@ -288,6 +343,15 @@ func applyEnv(cfg *Config) error {
 			}
 			*f.dst = n
 		}
+	}
+
+	// 請求體上限為 int64，單獨解析以免在 32 位元平台溢位。
+	if v := os.Getenv("ER_SERVER_MAX_BODY_BYTES"); v != "" {
+		n, err := strconv.ParseInt(v, 10, 64)
+		if err != nil {
+			return fmt.Errorf("config: 環境變數 ER_SERVER_MAX_BODY_BYTES 需為整數，實際為 %q", v)
+		}
+		cfg.Server.MaxBodyBytes = n
 	}
 	return nil
 }
@@ -302,6 +366,14 @@ server:
   listen: "127.0.0.1:5206"          # HTTP 監聽地址；區域網部署時改為主機區域網 IP
   data_dir: "."                     # 執行資料目錄（預設 evernight-data/）
   display_timezone: "Asia/Shanghai" # 伺服器顯示時區；資料庫仍以 UTC 儲存
+
+  # HTTP 層保護參數（單位：毫秒 / 位元組）；request 不得大於 write。
+  read_header_timeout_ms: 5000      # 標頭讀取逾時
+  read_timeout_ms: 15000            # 整個請求讀取逾時
+  write_timeout_ms: 30000           # 回應寫入逾時
+  idle_timeout_ms: 60000            # keep-alive 空閒逾時
+  request_timeout_ms: 10000         # 單次處理期限（超過回 503）
+  max_body_bytes: 1048576           # JSON 請求體上限（1 MiB）
 
 database:
   path: "evernight.db"              # SQLite 檔案（相對 data_dir）

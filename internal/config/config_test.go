@@ -101,6 +101,68 @@ func TestLoadInvalidEnvInt(t *testing.T) {
 	}
 }
 
+func TestDefaultHTTPProtectionValues(t *testing.T) {
+	cfg := Default()
+	if cfg.Server.RequestTimeoutMS <= 0 || cfg.Server.ReadHeaderTimeoutMS <= 0 ||
+		cfg.Server.ReadTimeoutMS <= 0 || cfg.Server.WriteTimeoutMS <= 0 || cfg.Server.IdleTimeoutMS <= 0 {
+		t.Errorf("HTTP 層逾時預設值應為正數: %+v", cfg.Server)
+	}
+	if cfg.Server.RequestTimeoutMS > cfg.Server.WriteTimeoutMS {
+		t.Errorf("預設處理期限不得大於回應寫入期限: request=%d write=%d",
+			cfg.Server.RequestTimeoutMS, cfg.Server.WriteTimeoutMS)
+	}
+	if cfg.Server.MaxBodyBytes != 1<<20 {
+		t.Errorf("請求體上限預設應為 1 MiB，實際 %d", cfg.Server.MaxBodyBytes)
+	}
+}
+
+func TestLoadHTTPProtectionFromYAMLAndEnv(t *testing.T) {
+	p := writeConfig(t, "server:\n  request_timeout_ms: 3000\n  max_body_bytes: 2048\n")
+	cfg, err := Load(Options{ConfigPath: p})
+	if err != nil {
+		t.Fatalf("Load 失敗: %v", err)
+	}
+	if cfg.Server.RequestTimeoutMS != 3000 || cfg.Server.MaxBodyBytes != 2048 {
+		t.Errorf("yaml 應覆蓋 HTTP 保護參數: request=%d body=%d", cfg.Server.RequestTimeoutMS, cfg.Server.MaxBodyBytes)
+	}
+
+	t.Setenv("ER_SERVER_REQUEST_TIMEOUT_MS", "4000")
+	t.Setenv("ER_SERVER_MAX_BODY_BYTES", "8192")
+	cfg, err = Load(Options{ConfigPath: p})
+	if err != nil {
+		t.Fatalf("Load 失敗: %v", err)
+	}
+	if cfg.Server.RequestTimeoutMS != 4000 || cfg.Server.MaxBodyBytes != 8192 {
+		t.Errorf("環境變數應覆蓋 yaml: request=%d body=%d", cfg.Server.RequestTimeoutMS, cfg.Server.MaxBodyBytes)
+	}
+}
+
+func TestValidateHTTPProtection(t *testing.T) {
+	cases := []struct {
+		name   string
+		mutate func(*Config)
+		want   string
+	}{
+		{"處理期限非正數", func(c *Config) { c.Server.RequestTimeoutMS = 0 }, "server.request_timeout_ms"},
+		{"標頭期限非正數", func(c *Config) { c.Server.ReadHeaderTimeoutMS = -1 }, "server.read_header_timeout_ms"},
+		{"讀取期限非正數", func(c *Config) { c.Server.ReadTimeoutMS = 0 }, "server.read_timeout_ms"},
+		{"寫入期限非正數", func(c *Config) { c.Server.WriteTimeoutMS = 0 }, "server.write_timeout_ms"},
+		{"空閒期限非正數", func(c *Config) { c.Server.IdleTimeoutMS = 0 }, "server.idle_timeout_ms"},
+		{"處理期限長於寫入期限", func(c *Config) { c.Server.RequestTimeoutMS = 60000 }, "不得大於 server.write_timeout_ms"},
+		{"請求體上限過小", func(c *Config) { c.Server.MaxBodyBytes = 16 }, "server.max_body_bytes"},
+		{"請求體上限過大", func(c *Config) { c.Server.MaxBodyBytes = 1 << 30 }, "server.max_body_bytes"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := Default()
+			tc.mutate(&cfg)
+			if err := cfg.Validate(); err == nil || !strings.Contains(err.Error(), tc.want) {
+				t.Errorf("應報錯包含 %q，實際: %v", tc.want, err)
+			}
+		})
+	}
+}
+
 func TestValidateBadListen(t *testing.T) {
 	cases := []struct {
 		listen string

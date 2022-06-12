@@ -1,7 +1,8 @@
 // Package httpapi 提供服務端 HTTP 層：路由掛載、中介層鏈、統一錯誤信封與存活檢查端點。
 //
 // 業務端點一律掛在根路徑（無版本前綴，依 S02 決策），由 registerRoutes 集中登記。
-// 請求大小、逾時與解碼限制及安全回應頭於後續步驟加入。
+// 輸入保護（請求體上限、處理期限、連線層期限、JSON 解碼限制）於中介層與 http.Server 設定；
+// 安全回應頭於後續步驟加入。
 package httpapi
 
 import (
@@ -11,6 +12,7 @@ import (
 	"net/http"
 	"os"
 	"strings"
+	"time"
 
 	"github.com/kagurazakayashi/evernight-realm/internal/config"
 )
@@ -33,16 +35,32 @@ func New(cfg *config.Config, version string) *Server {
 	s.httpSrv = &http.Server{
 		Addr:    cfg.Server.Listen,
 		Handler: s.Handler(),
+		// 連線層期限（STEP-034）：標頭、整個請求讀取、回應寫入與 keep-alive 空閒。
+		ReadHeaderTimeout: time.Duration(cfg.Server.ReadHeaderTimeoutMS) * time.Millisecond,
+		ReadTimeout:       time.Duration(cfg.Server.ReadTimeoutMS) * time.Millisecond,
+		WriteTimeout:      time.Duration(cfg.Server.WriteTimeoutMS) * time.Millisecond,
+		IdleTimeout:       time.Duration(cfg.Server.IdleTimeoutMS) * time.Millisecond,
+		// 標頭總量上限：一般請求（含 Cookie）遠低於此值，用於擋標頭洪水。
+		MaxHeaderBytes: maxHeaderBytes,
+		ErrorLog:       s.logger,
 	}
 	return s
 }
 
+// maxHeaderBytes 為請求行與標頭總量上限（64 KiB）。
+const maxHeaderBytes = 1 << 16
+
 // Handler 回傳套用中介層鏈後的路由樹，供 http.Server 或測試伺服器使用。
-// 中介層由外而內為：請求關聯 ID → panic 恢復 → 路由。
 func (s *Server) Handler() http.Handler {
 	mux := http.NewServeMux()
 	s.registerRoutes(mux)
-	return chain(mux, withRequestID, s.withRecovery)
+	return s.wrap(mux)
+}
+
+// wrap 為路由樹套上完整中介層鏈（測試亦以本方法組裝，確保與正式路徑一致）。
+// 中介層由外而內為：請求關聯 ID → panic 恢復 → 處理期限 → 請求體上限 → 路由。
+func (s *Server) wrap(h http.Handler) http.Handler {
+	return chain(h, withRequestID, s.withRecovery, s.withTimeout, s.withBodyLimit)
 }
 
 // registerRoutes 集中登記路由；未登記的路徑與不支援的方法都回傳統一錯誤信封。

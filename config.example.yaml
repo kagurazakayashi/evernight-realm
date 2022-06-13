@@ -39,3 +39,11 @@ logs:
 # ---- 安全（部署者自行生成，勿在此提交真實值） ----
 security:
   session_ttl_hours: 24
+
+  # HTTP 安全回應頭（STEP-035）；留空即用內建預設，只有確實需要時才覆寫。
+  # frame_options 可選 DENY | SAMEORIGIN；csp 不得含 'unsafe-eval'。
+  headers:
+    content_security_policy: ""       # 空 = 內建預設（相容本機 Flutter Web）
+    frame_options: ""                 # 空 = DENY
+    referrer_policy: ""               # 空 = no-referrer
+    permissions_policy: ""            # 空 = camera=(self), microphone=(), geolocation=()

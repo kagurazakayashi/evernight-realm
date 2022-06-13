@@ -2,7 +2,7 @@
 //
 // 業務端點一律掛在根路徑（無版本前綴，依 S02 決策），由 registerRoutes 集中登記。
 // 輸入保護（請求體上限、處理期限、連線層期限、JSON 解碼限制）於中介層與 http.Server 設定；
-// 安全回應頭於後續步驟加入。
+// 安全回應頭（CSP、內容型別保護、Frame 限制等）由 withSecurityHeaders 對所有回應套用。
 package httpapi
 
 import (
@@ -23,14 +23,17 @@ type Server struct {
 	version string
 	logger  *log.Logger
 	httpSrv *http.Server
+	// secHeaders 為啟動時算好的安全回應頭（組態留空時為內建基線）。
+	secHeaders securityHeaderSet
 }
 
 // New 以組態與版本字串建立 HTTP 服務層；伺服器端日誌固定寫往標準錯誤輸出。
 func New(cfg *config.Config, version string) *Server {
 	s := &Server{
-		cfg:     cfg,
-		version: version,
-		logger:  log.New(os.Stderr, "evernight-server ", log.LstdFlags),
+		cfg:        cfg,
+		version:    version,
+		logger:     log.New(os.Stderr, "evernight-server ", log.LstdFlags),
+		secHeaders: buildSecurityHeaders(cfg),
 	}
 	s.httpSrv = &http.Server{
 		Addr:    cfg.Server.Listen,
@@ -58,9 +61,9 @@ func (s *Server) Handler() http.Handler {
 }
 
 // wrap 為路由樹套上完整中介層鏈（測試亦以本方法組裝，確保與正式路徑一致）。
-// 中介層由外而內為：請求關聯 ID → panic 恢復 → 處理期限 → 請求體上限 → 路由。
+// 中介層由外而內為：請求關聯 ID → 安全回應頭 → panic 恢復 → 處理期限 → 請求體上限 → 路由。
 func (s *Server) wrap(h http.Handler) http.Handler {
-	return chain(h, withRequestID, s.withRecovery, s.withTimeout, s.withBodyLimit)
+	return chain(h, withRequestID, s.withSecurityHeaders, s.withRecovery, s.withTimeout, s.withBodyLimit)
 }
 
 // registerRoutes 集中登記路由；未登記的路徑與不支援的方法都回傳統一錯誤信封。

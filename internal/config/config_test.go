@@ -137,6 +137,74 @@ func TestLoadHTTPProtectionFromYAMLAndEnv(t *testing.T) {
 	}
 }
 
+func TestDefaultSecurityHeadersAreEmpty(t *testing.T) {
+	// 預設留空即採用 httpapi 套件的內建基線；組態不重複寫死策略，避免兩處漂移。
+	h := Default().Security.Headers
+	if h.ContentSecurityPolicy != "" || h.FrameOptions != "" ||
+		h.ReferrerPolicy != "" || h.PermissionsPolicy != "" {
+		t.Errorf("安全回應頭預設應留空（用內建基線），實際 %+v", h)
+	}
+}
+
+func TestValidateSecurityHeaders(t *testing.T) {
+	cases := []struct {
+		name   string
+		mutate func(*Config)
+		want   string
+	}{
+		{"Frame 限制非法值", func(c *Config) { c.Security.Headers.FrameOptions = "ALLOWALL" }, "frame_options"},
+		{"CSP 缺少必要指令", func(c *Config) { c.Security.Headers.ContentSecurityPolicy = "img-src 'self'" }, "default-src"},
+		{"CSP 含 unsafe-eval", func(c *Config) {
+			c.Security.Headers.ContentSecurityPolicy = "default-src 'self'; script-src 'self' 'unsafe-eval'"
+		}, "'unsafe-eval'"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := Default()
+			tc.mutate(&cfg)
+			if err := cfg.Validate(); err == nil || !strings.Contains(err.Error(), tc.want) {
+				t.Errorf("應報錯包含 %q，實際: %v", tc.want, err)
+			}
+		})
+	}
+
+	t.Run("合法覆寫與正規化", func(t *testing.T) {
+		cfg := Default()
+		cfg.Security.Headers.FrameOptions = " sameorigin "
+		cfg.Security.Headers.ContentSecurityPolicy = "default-src 'none'; script-src 'self' 'wasm-unsafe-eval'"
+		if err := cfg.Validate(); err != nil {
+			t.Fatalf("合法安全頭組態不應報錯: %v", err)
+		}
+		if cfg.Security.Headers.FrameOptions != "SAMEORIGIN" {
+			t.Errorf("frame_options 應正規化為大寫，實際 %q", cfg.Security.Headers.FrameOptions)
+		}
+	})
+}
+
+func TestLoadSecurityHeadersFromYAMLAndEnv(t *testing.T) {
+	p := writeConfig(t, "security:\n  headers:\n    frame_options: DENY\n    referrer_policy: no-referrer\n")
+	cfg, err := Load(Options{ConfigPath: p})
+	if err != nil {
+		t.Fatalf("Load 失敗: %v", err)
+	}
+	if cfg.Security.Headers.FrameOptions != "DENY" || cfg.Security.Headers.ReferrerPolicy != "no-referrer" {
+		t.Errorf("yaml 應載入安全回應頭: %+v", cfg.Security.Headers)
+	}
+
+	t.Setenv("ER_SECURITY_HEADERS_PERMISSIONS_POLICY", "camera=(self)")
+	t.Setenv("ER_SECURITY_HEADERS_FRAME_OPTIONS", "sameorigin")
+	cfg, err = Load(Options{ConfigPath: p})
+	if err != nil {
+		t.Fatalf("Load 失敗: %v", err)
+	}
+	if cfg.Security.Headers.PermissionsPolicy != "camera=(self)" {
+		t.Errorf("環境變數應覆蓋權限策略，實際 %q", cfg.Security.Headers.PermissionsPolicy)
+	}
+	if cfg.Security.Headers.FrameOptions != "SAMEORIGIN" {
+		t.Errorf("環境變數值應同樣正規化，實際 %q", cfg.Security.Headers.FrameOptions)
+	}
+}
+
 func TestValidateHTTPProtection(t *testing.T) {
 	cases := []struct {
 		name   string

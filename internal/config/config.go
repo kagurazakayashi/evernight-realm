@@ -76,6 +76,23 @@ type SecurityConfig struct {
 	// Root 憑據（Argon2id 雜湊）僅存於資料目錄 config.yaml；
 	// Redacted() 與所有日誌永不輸出其明文。
 	RootPasswordHash string `yaml:"root_password_hash"`
+	// Headers 為 HTTP 安全回應頭（STEP-035）。
+	Headers SecurityHeadersConfig `yaml:"headers"`
+}
+
+// SecurityHeadersConfig 為 HTTP 安全回應頭組態。
+//
+// 空值代表採用內建預設策略（見 httpapi 套件的預設常數）；只有確實需要時才覆寫。
+// 覆寫內容由部署者自行負責，服務端僅校驗基本健全性，阻擋明顯放寬（如 'unsafe-eval'）。
+type SecurityHeadersConfig struct {
+	// ContentSecurityPolicy 為完整 CSP 策略字串；空值表示使用內建預設（相容本機 Flutter Web）。
+	ContentSecurityPolicy string `yaml:"content_security_policy"`
+	// FrameOptions 為 X-Frame-Options；空值表示 DENY，可選 DENY 或 SAMEORIGIN。
+	FrameOptions string `yaml:"frame_options"`
+	// ReferrerPolicy 為 Referrer-Policy；空值表示內建預設。
+	ReferrerPolicy string `yaml:"referrer_policy"`
+	// PermissionsPolicy 為 Permissions-Policy；空值表示內建預設（相機僅允許同源）。
+	PermissionsPolicy string `yaml:"permissions_policy"`
 }
 
 // Default 回傳內建安全預設值（與 config.example.yaml 一致）。
@@ -257,6 +274,24 @@ func (c *Config) Validate() error {
 		!strings.HasPrefix(c.Security.RootPasswordHash, "$argon2id$") {
 		return errors.New("config: security.root_password_hash 需為 Argon2id 雜湊（$argon2id$ 前綴）")
 	}
+
+	// 安全回應頭：Frame 限制正規化為大寫並限枚舉值；
+	// CSP 覆寫必須是有效策略且不得引入 'unsafe-eval'（專案安全基線）。
+	c.Security.Headers.FrameOptions = strings.ToUpper(strings.TrimSpace(c.Security.Headers.FrameOptions))
+	switch c.Security.Headers.FrameOptions {
+	case "", "DENY", "SAMEORIGIN":
+	default:
+		return fmt.Errorf("config: security.headers.frame_options 需為 DENY 或 SAMEORIGIN，實際為 %q",
+			c.Security.Headers.FrameOptions)
+	}
+	if csp := strings.TrimSpace(c.Security.Headers.ContentSecurityPolicy); csp != "" {
+		if !strings.Contains(csp, "default-src") && !strings.Contains(csp, "script-src") {
+			return errors.New("config: security.headers.content_security_policy 需至少包含 default-src 或 script-src 指令")
+		}
+		if strings.Contains(csp, "'unsafe-eval'") {
+			return errors.New("config: security.headers.content_security_policy 不得包含 'unsafe-eval'（專案安全基線）")
+		}
+	}
 	return nil
 }
 
@@ -278,14 +313,34 @@ func (c Config) ListenAllInterfaces() bool {
 
 // Redacted 回傳組態的脫敏摘要（供啟動日誌），機密欄位一律顯示 [REDACTED]。
 func (c Config) Redacted() string {
-	return fmt.Sprintf("組態摘要：listen=%s data_dir=%s timezone=%s db=%s busy_timeout_ms=%d media=%s documents=%s attachments=%s backups=%s logs_dir=%s logs_level=%s session_ttl_hours=%d root_password_hash=%s http_timeouts_ms=[read_header=%d read=%d write=%d idle=%d request=%d] max_body_bytes=%d",
+	return fmt.Sprintf("組態摘要：listen=%s data_dir=%s timezone=%s db=%s busy_timeout_ms=%d media=%s documents=%s attachments=%s backups=%s logs_dir=%s logs_level=%s session_ttl_hours=%d root_password_hash=%s http_timeouts_ms=[read_header=%d read=%d write=%d idle=%d request=%d] max_body_bytes=%d security_headers=[frame_options=%s csp=%s referrer_policy=%s permissions_policy=%s]",
 		c.Server.Listen, c.Server.DataDir, c.Server.DisplayTimezone,
 		c.Database.Path, c.Database.BusyTimeoutMS,
 		c.Media, c.Documents, c.Attachments, c.Backups,
 		c.Logs.Dir, c.Logs.Level,
 		c.Security.SessionTTLHours, redact(c.Security.RootPasswordHash),
 		c.Server.ReadHeaderTimeoutMS, c.Server.ReadTimeoutMS, c.Server.WriteTimeoutMS,
-		c.Server.IdleTimeoutMS, c.Server.RequestTimeoutMS, c.Server.MaxBodyBytes)
+		c.Server.IdleTimeoutMS, c.Server.RequestTimeoutMS, c.Server.MaxBodyBytes,
+		orDefault(c.Security.Headers.FrameOptions, "DENY"),
+		presence(c.Security.Headers.ContentSecurityPolicy),
+		presence(c.Security.Headers.ReferrerPolicy),
+		presence(c.Security.Headers.PermissionsPolicy))
+}
+
+// presence 將安全回應頭的覆寫值表示為「自訂」或「(預設)」，避免摘要輸出整段策略。
+func presence(value string) string {
+	if strings.TrimSpace(value) == "" {
+		return "(預設)"
+	}
+	return "自訂"
+}
+
+// orDefault 回傳非空值，空值時回傳預設表示。
+func orDefault(value, fallback string) string {
+	if strings.TrimSpace(value) == "" {
+		return fallback
+	}
+	return value
 }
 
 func redact(s string) string {
@@ -315,6 +370,10 @@ func applyEnv(cfg *Config) error {
 		{&cfg.Logs.Dir, "ER_LOGS_DIR"},
 		{&cfg.Logs.Level, "ER_LOGS_LEVEL"},
 		{&cfg.Security.RootPasswordHash, "ER_SECURITY_ROOT_PASSWORD_HASH"},
+		{&cfg.Security.Headers.ContentSecurityPolicy, "ER_SECURITY_HEADERS_CONTENT_SECURITY_POLICY"},
+		{&cfg.Security.Headers.FrameOptions, "ER_SECURITY_HEADERS_FRAME_OPTIONS"},
+		{&cfg.Security.Headers.ReferrerPolicy, "ER_SECURITY_HEADERS_REFERRER_POLICY"},
+		{&cfg.Security.Headers.PermissionsPolicy, "ER_SECURITY_HEADERS_PERMISSIONS_POLICY"},
 	}
 	for _, f := range strs {
 		if v := os.Getenv(f.env); v != "" {
@@ -388,6 +447,14 @@ logs:
 
 security:
   session_ttl_hours: 24
+
+  # HTTP 安全回應頭（STEP-035）；留空即用內建預設，只有確實需要時才覆寫。
+  # frame_options 可選 DENY | SAMEORIGIN；csp 不得含 'unsafe-eval'。
+  headers:
+    content_security_policy: ""       # 空 = 內建預設（相容本機 Flutter Web）
+    frame_options: ""                 # 空 = DENY
+    referrer_policy: ""               # 空 = no-referrer
+    permissions_policy: ""            # 空 = camera=(self), microphone=(), geolocation=()
 `
 
 // Resolve 將所有相對路徑欄位解析為資料目錄下的絕對路徑並清除冗餘片段。

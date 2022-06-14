@@ -6,6 +6,8 @@
 package httpapi
 
 import (
+	"context"
+	"errors"
 	"fmt"
 	"log"
 	"net"
@@ -86,16 +88,42 @@ func (s *Server) allowMethods(handler http.HandlerFunc, methods ...string) http.
 	}
 }
 
-// ListenAndServe 監聽組態指定的地址並提供服務，阻塞至錯誤發生（如連接埠被佔用）。
-func (s *Server) ListenAndServe() error {
+// Listen 依組態建立 TCP 監聽器；失敗時回傳含地址的錯誤（如連接埠被佔用）。
+//
+// 監聽與服務分離，讓呼叫端（internal/app）能先取得實際地址再啟動服務，
+// 並在停止時掌握監聽資源的生命週期。
+func (s *Server) Listen() (net.Listener, error) {
 	ln, err := net.Listen("tcp", s.cfg.Server.Listen)
 	if err != nil {
-		return fmt.Errorf("httpapi: 監聽 %s 失敗: %w", s.cfg.Server.Listen, err)
+		return nil, fmt.Errorf("httpapi: 監聽 %s 失敗: %w", s.cfg.Server.Listen, err)
 	}
-	if err := s.httpSrv.Serve(ln); err != nil && err != http.ErrServerClosed {
+	return ln, nil
+}
+
+// Serve 在已建立的監聽器上提供服務，阻塞至服務停止或異常終止。
+// 正常停止（呼叫 Shutdown 或 Close）回傳 nil，其他錯誤包裝後回傳。
+func (s *Server) Serve(ln net.Listener) error {
+	if err := s.httpSrv.Serve(ln); err != nil && !errors.Is(err, http.ErrServerClosed) {
 		return fmt.Errorf("httpapi: 服務異常終止: %w", err)
 	}
 	return nil
+}
+
+// Shutdown 優雅停止服務：停止接受新連線、等待進行中的請求完成，並釋放監聽資源。
+// ctx 逾時時回傳 ctx.Err()，由呼叫端決定是否改以 Close 強制關閉。
+func (s *Server) Shutdown(ctx context.Context) error {
+	return s.httpSrv.Shutdown(ctx)
+}
+
+// Close 立即關閉服務與所有連線，不等待進行中的請求；
+// 僅用於優雅停止逾時的兵底，正常停止請用 Shutdown。
+func (s *Server) Close() error {
+	return s.httpSrv.Close()
+}
+
+// ShutdownTimeout 回傳組態的優雅停止等待上限，供呼叫端設定停止期限。
+func (s *Server) ShutdownTimeout() time.Duration {
+	return time.Duration(s.cfg.Server.ShutdownTimeoutMS) * time.Millisecond
 }
 
 // healthResponse 為存活檢查回應；request_id 供用戶端對應伺服器端診斷日誌。

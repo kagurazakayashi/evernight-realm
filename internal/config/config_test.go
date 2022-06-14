@@ -104,8 +104,12 @@ func TestLoadInvalidEnvInt(t *testing.T) {
 func TestDefaultHTTPProtectionValues(t *testing.T) {
 	cfg := Default()
 	if cfg.Server.RequestTimeoutMS <= 0 || cfg.Server.ReadHeaderTimeoutMS <= 0 ||
-		cfg.Server.ReadTimeoutMS <= 0 || cfg.Server.WriteTimeoutMS <= 0 || cfg.Server.IdleTimeoutMS <= 0 {
+		cfg.Server.ReadTimeoutMS <= 0 || cfg.Server.WriteTimeoutMS <= 0 || cfg.Server.IdleTimeoutMS <= 0 ||
+		cfg.Server.ShutdownTimeoutMS <= 0 {
 		t.Errorf("HTTP 層逾時預設值應為正數: %+v", cfg.Server)
+	}
+	if cfg.Server.ShutdownTimeoutMS != 10000 {
+		t.Errorf("優雅停止期限預設應為 10000 毫秒，實際 %d", cfg.Server.ShutdownTimeoutMS)
 	}
 	if cfg.Server.RequestTimeoutMS > cfg.Server.WriteTimeoutMS {
 		t.Errorf("預設處理期限不得大於回應寫入期限: request=%d write=%d",
@@ -117,23 +121,26 @@ func TestDefaultHTTPProtectionValues(t *testing.T) {
 }
 
 func TestLoadHTTPProtectionFromYAMLAndEnv(t *testing.T) {
-	p := writeConfig(t, "server:\n  request_timeout_ms: 3000\n  max_body_bytes: 2048\n")
+	p := writeConfig(t, "server:\n  request_timeout_ms: 3000\n  shutdown_timeout_ms: 6000\n  max_body_bytes: 2048\n")
 	cfg, err := Load(Options{ConfigPath: p})
 	if err != nil {
 		t.Fatalf("Load 失敗: %v", err)
 	}
-	if cfg.Server.RequestTimeoutMS != 3000 || cfg.Server.MaxBodyBytes != 2048 {
-		t.Errorf("yaml 應覆蓋 HTTP 保護參數: request=%d body=%d", cfg.Server.RequestTimeoutMS, cfg.Server.MaxBodyBytes)
+	if cfg.Server.RequestTimeoutMS != 3000 || cfg.Server.MaxBodyBytes != 2048 || cfg.Server.ShutdownTimeoutMS != 6000 {
+		t.Errorf("yaml 應覆蓋 HTTP 保護參數: request=%d body=%d shutdown=%d",
+			cfg.Server.RequestTimeoutMS, cfg.Server.MaxBodyBytes, cfg.Server.ShutdownTimeoutMS)
 	}
 
 	t.Setenv("ER_SERVER_REQUEST_TIMEOUT_MS", "4000")
 	t.Setenv("ER_SERVER_MAX_BODY_BYTES", "8192")
+	t.Setenv("ER_SERVER_SHUTDOWN_TIMEOUT_MS", "7000")
 	cfg, err = Load(Options{ConfigPath: p})
 	if err != nil {
 		t.Fatalf("Load 失敗: %v", err)
 	}
-	if cfg.Server.RequestTimeoutMS != 4000 || cfg.Server.MaxBodyBytes != 8192 {
-		t.Errorf("環境變數應覆蓋 yaml: request=%d body=%d", cfg.Server.RequestTimeoutMS, cfg.Server.MaxBodyBytes)
+	if cfg.Server.RequestTimeoutMS != 4000 || cfg.Server.MaxBodyBytes != 8192 || cfg.Server.ShutdownTimeoutMS != 7000 {
+		t.Errorf("環境變數應覆蓋 yaml: request=%d body=%d shutdown=%d",
+			cfg.Server.RequestTimeoutMS, cfg.Server.MaxBodyBytes, cfg.Server.ShutdownTimeoutMS)
 	}
 }
 
@@ -216,6 +223,7 @@ func TestValidateHTTPProtection(t *testing.T) {
 		{"讀取期限非正數", func(c *Config) { c.Server.ReadTimeoutMS = 0 }, "server.read_timeout_ms"},
 		{"寫入期限非正數", func(c *Config) { c.Server.WriteTimeoutMS = 0 }, "server.write_timeout_ms"},
 		{"空閒期限非正數", func(c *Config) { c.Server.IdleTimeoutMS = 0 }, "server.idle_timeout_ms"},
+		{"停止期限非正數", func(c *Config) { c.Server.ShutdownTimeoutMS = 0 }, "server.shutdown_timeout_ms"},
 		{"處理期限長於寫入期限", func(c *Config) { c.Server.RequestTimeoutMS = 60000 }, "不得大於 server.write_timeout_ms"},
 		{"請求體上限過小", func(c *Config) { c.Server.MaxBodyBytes = 16 }, "server.max_body_bytes"},
 		{"請求體上限過大", func(c *Config) { c.Server.MaxBodyBytes = 1 << 30 }, "server.max_body_bytes"},

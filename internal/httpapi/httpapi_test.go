@@ -1,6 +1,7 @@
 package httpapi
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -72,7 +73,7 @@ func TestUnknownPath404(t *testing.T) {
 	}
 }
 
-func TestListenAndServeWithConfiguredPort(t *testing.T) {
+func TestServeWithConfiguredPort(t *testing.T) {
 	// 取一個本機可用連接埠後關閉，再以該連接埠啟動服務（驗證地址與連接埠可配置）。
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
@@ -84,11 +85,20 @@ func TestListenAndServeWithConfiguredPort(t *testing.T) {
 	cfg := config.Default()
 	cfg.Server.Listen = fmt.Sprintf("127.0.0.1:%d", port)
 	srv := New(&cfg, testVersion)
+	serverLn, err := srv.Listen()
+	if err != nil {
+		t.Fatalf("Listen 失敗: %v", err)
+	}
 	go func() {
-		if err := srv.ListenAndServe(); err != nil {
-			t.Errorf("ListenAndServe 失敗: %v", err)
+		if err := srv.Serve(serverLn); err != nil {
+			t.Errorf("Serve 失敗: %v", err)
 		}
 	}()
+	t.Cleanup(func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		defer cancel()
+		_ = srv.Shutdown(ctx)
+	})
 
 	url := fmt.Sprintf("http://127.0.0.1:%d/health", port)
 	var resp *http.Response
@@ -108,7 +118,7 @@ func TestListenAndServeWithConfiguredPort(t *testing.T) {
 	}
 }
 
-func TestListenAndServePortInUse(t *testing.T) {
+func TestListenPortInUse(t *testing.T) {
 	// 先佔用一個連接埠，再嘗試監聽同一連接埠應回傳錯誤。
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
@@ -120,7 +130,11 @@ func TestListenAndServePortInUse(t *testing.T) {
 	cfg := config.Default()
 	cfg.Server.Listen = fmt.Sprintf("127.0.0.1:%d", port)
 	srv := New(&cfg, testVersion)
-	if err := srv.ListenAndServe(); err == nil {
-		t.Fatal("連接埠被佔用時 ListenAndServe 應回傳錯誤")
+	_, err = srv.Listen()
+	if err == nil {
+		t.Fatal("連接埠被佔用時 Listen 應回傳錯誤")
+	}
+	if !strings.Contains(err.Error(), "監聽") {
+		t.Fatalf("錯誤訊息應說明監聽失敗與地址，實際: %v", err)
 	}
 }

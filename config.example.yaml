@@ -19,6 +19,7 @@ server:
   idle_timeout_ms: 60000            # keep-alive 空閒逾時
   request_timeout_ms: 10000         # 單次處理期限（超過回 503）
   max_body_bytes: 1048576           # JSON 請求體上限（1 MiB）
+  shutdown_timeout_ms: 10000        # 優雅停止等待進行中請求的上限（逾時強制關閉）
 
 # ---- 資料庫 ----
 database:

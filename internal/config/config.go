@@ -56,6 +56,10 @@ type ServerConfig struct {
 	IdleTimeoutMS       int   `yaml:"idle_timeout_ms"`
 	RequestTimeoutMS    int   `yaml:"request_timeout_ms"`
 	MaxBodyBytes        int64 `yaml:"max_body_bytes"` // JSON API 請求體上限；上傳路由日後單獨放寬
+
+	// ShutdownTimeoutMS 為優雅停止時等待進行中請求完成的上限（STEP-036）。
+	// 逾時則強制關閉連線，確保程序能結束並釋放監聽資源。
+	ShutdownTimeoutMS int `yaml:"shutdown_timeout_ms"`
 }
 
 // DatabaseConfig 為 SQLite 資料庫組態。
@@ -108,6 +112,7 @@ func Default() Config {
 			IdleTimeoutMS:       60000,
 			RequestTimeoutMS:    10000,
 			MaxBodyBytes:        1 << 20,
+			ShutdownTimeoutMS:   10000,
 		},
 		Database: DatabaseConfig{
 			Path:          "evernight.db",
@@ -226,6 +231,7 @@ func (c *Config) Validate() error {
 		{"server.write_timeout_ms", c.Server.WriteTimeoutMS},
 		{"server.idle_timeout_ms", c.Server.IdleTimeoutMS},
 		{"server.request_timeout_ms", c.Server.RequestTimeoutMS},
+		{"server.shutdown_timeout_ms", c.Server.ShutdownTimeoutMS},
 	}
 	for _, t := range timeouts {
 		if t.value < 1 {
@@ -313,14 +319,14 @@ func (c Config) ListenAllInterfaces() bool {
 
 // Redacted 回傳組態的脫敏摘要（供啟動日誌），機密欄位一律顯示 [REDACTED]。
 func (c Config) Redacted() string {
-	return fmt.Sprintf("組態摘要：listen=%s data_dir=%s timezone=%s db=%s busy_timeout_ms=%d media=%s documents=%s attachments=%s backups=%s logs_dir=%s logs_level=%s session_ttl_hours=%d root_password_hash=%s http_timeouts_ms=[read_header=%d read=%d write=%d idle=%d request=%d] max_body_bytes=%d security_headers=[frame_options=%s csp=%s referrer_policy=%s permissions_policy=%s]",
+	return fmt.Sprintf("組態摘要：listen=%s data_dir=%s timezone=%s db=%s busy_timeout_ms=%d media=%s documents=%s attachments=%s backups=%s logs_dir=%s logs_level=%s session_ttl_hours=%d root_password_hash=%s http_timeouts_ms=[read_header=%d read=%d write=%d idle=%d request=%d shutdown=%d] max_body_bytes=%d security_headers=[frame_options=%s csp=%s referrer_policy=%s permissions_policy=%s]",
 		c.Server.Listen, c.Server.DataDir, c.Server.DisplayTimezone,
 		c.Database.Path, c.Database.BusyTimeoutMS,
 		c.Media, c.Documents, c.Attachments, c.Backups,
 		c.Logs.Dir, c.Logs.Level,
 		c.Security.SessionTTLHours, redact(c.Security.RootPasswordHash),
 		c.Server.ReadHeaderTimeoutMS, c.Server.ReadTimeoutMS, c.Server.WriteTimeoutMS,
-		c.Server.IdleTimeoutMS, c.Server.RequestTimeoutMS, c.Server.MaxBodyBytes,
+		c.Server.IdleTimeoutMS, c.Server.RequestTimeoutMS, c.Server.ShutdownTimeoutMS, c.Server.MaxBodyBytes,
 		orDefault(c.Security.Headers.FrameOptions, "DENY"),
 		presence(c.Security.Headers.ContentSecurityPolicy),
 		presence(c.Security.Headers.ReferrerPolicy),
@@ -393,6 +399,7 @@ func applyEnv(cfg *Config) error {
 		{&cfg.Server.WriteTimeoutMS, "ER_SERVER_WRITE_TIMEOUT_MS"},
 		{&cfg.Server.IdleTimeoutMS, "ER_SERVER_IDLE_TIMEOUT_MS"},
 		{&cfg.Server.RequestTimeoutMS, "ER_SERVER_REQUEST_TIMEOUT_MS"},
+		{&cfg.Server.ShutdownTimeoutMS, "ER_SERVER_SHUTDOWN_TIMEOUT_MS"},
 	}
 	for _, f := range ints {
 		if v := os.Getenv(f.env); v != "" {

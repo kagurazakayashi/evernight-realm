@@ -153,6 +153,178 @@ func TestDefaultSecurityHeadersAreEmpty(t *testing.T) {
 	}
 }
 
+func TestValidateDatabaseGates(t *testing.T) {
+	// 預檢模式與寫入把關層級限枚舉值；空值代表採用內建預設。
+	cases := []struct {
+		name   string
+		mutate func(*Config)
+		want   string
+	}{
+		{"預檢模式非法值", func(c *Config) { c.Database.Preflight = "strict" }, "database.preflight"},
+		{"寫入把關層級非法值", func(c *Config) { c.Database.SchemaGuard = "always" }, "database.schema_guard"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := Default()
+			tc.mutate(&cfg)
+			if err := cfg.Validate(); err == nil || !strings.Contains(err.Error(), tc.want) {
+				t.Errorf("應報錯包含 %q，實際: %v", tc.want, err)
+			}
+		})
+	}
+
+	t.Run("預設值與空值回退", func(t *testing.T) {
+		cfg := Default()
+		if cfg.Database.Preflight != "header" {
+			t.Errorf("預設預檢模式應為 header，實際 %q", cfg.Database.Preflight)
+		}
+		if cfg.Database.SchemaGuard != "startup" {
+			t.Errorf("預設寫入把關層級應為 startup，實際 %q", cfg.Database.SchemaGuard)
+		}
+		if cfg.Database.IntegrityCheck {
+			t.Error("預設不應在啟動時執行完整性自檢")
+		}
+
+		cfg.Database.Preflight = ""
+		cfg.Database.SchemaGuard = ""
+		if err := cfg.Validate(); err != nil {
+			t.Fatalf("空值應回退為預設: %v", err)
+		}
+		if cfg.Database.Preflight != "header" || cfg.Database.SchemaGuard != "startup" {
+			t.Errorf("空值應回退為 header/startup，實際 %q/%q", cfg.Database.Preflight, cfg.Database.SchemaGuard)
+		}
+	})
+
+	t.Run("YAML 可設定三項閘門", func(t *testing.T) {
+		p := writeConfig(t, `
+database:
+  preflight: "readonly"
+  integrity_check: true
+  schema_guard: "transaction"
+`)
+		cfg, err := Load(Options{ConfigPath: p})
+		if err != nil {
+			t.Fatalf("Load 失敗: %v", err)
+		}
+		if cfg.Database.Preflight != "readonly" || !cfg.Database.IntegrityCheck ||
+			cfg.Database.SchemaGuard != "transaction" {
+			t.Errorf("資料庫閘門組態未生效: %+v", cfg.Database)
+		}
+	})
+}
+
+func TestValidateTransactionBoundary(t *testing.T) {
+	// 交易邊界（STEP-041）：預設值、非法值、空值回退、YAML 與環境變數覆蓋。
+	t.Run("預設值", func(t *testing.T) {
+		tx := Default().Database.Transaction
+		if tx.BeginMode != "immediate" {
+			t.Errorf("預設 begin_mode 應為 immediate（失敗點固定於交易開始前），實際 %q", tx.BeginMode)
+		}
+		if tx.Nested != "reject" {
+			t.Errorf("預設 nested 應為 reject，實際 %q", tx.Nested)
+		}
+		if tx.BusyRetryMax != 0 {
+			t.Errorf("預設 busy_retry_max 應為 0（重試會重跑交易，需明確開啟），實際 %d", tx.BusyRetryMax)
+		}
+		if tx.BusyRetryBackoffMS != 50 {
+			t.Errorf("預設 busy_retry_backoff_ms 應為 50，實際 %d", tx.BusyRetryBackoffMS)
+		}
+		if tx.TimeoutMS != 10000 {
+			t.Errorf("預設 timeout_ms 應為 10000，實際 %d", tx.TimeoutMS)
+		}
+	})
+
+	cases := []struct {
+		name   string
+		mutate func(*Config)
+		want   string
+	}{
+		{"BEGIN 模式非法值", func(c *Config) { c.Database.Transaction.BeginMode = "exclusive" },
+			"database.transaction.begin_mode"},
+		{"嵌套策略非法值", func(c *Config) { c.Database.Transaction.Nested = "merge" },
+			"database.transaction.nested"},
+		{"重試次數負數", func(c *Config) { c.Database.Transaction.BusyRetryMax = -1 },
+			"database.transaction.busy_retry_max"},
+		{"退避負數", func(c *Config) { c.Database.Transaction.BusyRetryBackoffMS = -1 },
+			"database.transaction.busy_retry_backoff_ms"},
+		{"交易期限負數", func(c *Config) { c.Database.Transaction.TimeoutMS = -1 },
+			"database.transaction.timeout_ms"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := Default()
+			tc.mutate(&cfg)
+			if err := cfg.Validate(); err == nil || !strings.Contains(err.Error(), tc.want) {
+				t.Errorf("應報錯包含 %q，實際: %v", tc.want, err)
+			}
+		})
+	}
+
+	t.Run("空值回退與零值允許", func(t *testing.T) {
+		cfg := Default()
+		cfg.Database.Transaction = TransactionConfig{}
+		if err := cfg.Validate(); err != nil {
+			t.Fatalf("空值應回退為預設: %v", err)
+		}
+		if cfg.Database.Transaction.BeginMode != "immediate" || cfg.Database.Transaction.Nested != "reject" {
+			t.Errorf("空值應回退為 immediate/reject，實際 %+v", cfg.Database.Transaction)
+		}
+		// timeout_ms=0 表示不限制、busy_retry_backoff_ms=0 表示立即重試，皆為合法設定。
+		cfg.Database.Transaction.TimeoutMS = 0
+		cfg.Database.Transaction.BusyRetryBackoffMS = 0
+		if err := cfg.Validate(); err != nil {
+			t.Errorf("0 應被接受（不限制／立即重試）: %v", err)
+		}
+	})
+
+	t.Run("YAML 與環境變數覆蓋", func(t *testing.T) {
+		p := writeConfig(t, `
+database:
+  transaction:
+    begin_mode: "deferred"
+    nested: "savepoint"
+    busy_retry_max: 3
+    busy_retry_backoff_ms: 25
+    timeout_ms: 2000
+`)
+		cfg, err := Load(Options{ConfigPath: p})
+		if err != nil {
+			t.Fatalf("Load 失敗: %v", err)
+		}
+		tx := cfg.Database.Transaction
+		if tx.BeginMode != "deferred" || tx.Nested != "savepoint" || tx.BusyRetryMax != 3 ||
+			tx.BusyRetryBackoffMS != 25 || tx.TimeoutMS != 2000 {
+			t.Fatalf("YAML 覆蓋失敗: %+v", tx)
+		}
+
+		t.Setenv("ER_DATABASE_TRANSACTION_BEGIN_MODE", "immediate")
+		t.Setenv("ER_DATABASE_TRANSACTION_NESTED", "reuse")
+		t.Setenv("ER_DATABASE_TRANSACTION_BUSY_RETRY_MAX", "5")
+		t.Setenv("ER_DATABASE_TRANSACTION_TIMEOUT_MS", "1500")
+		cfg, err = Load(Options{ConfigPath: p})
+		if err != nil {
+			t.Fatalf("Load 失敗: %v", err)
+		}
+		tx = cfg.Database.Transaction
+		if tx.BeginMode != "immediate" || tx.Nested != "reuse" || tx.BusyRetryMax != 5 || tx.TimeoutMS != 1500 {
+			t.Fatalf("環境變數覆蓋失敗: %+v", tx)
+		}
+		if tx.BusyRetryBackoffMS != 25 {
+			t.Errorf("未以環境變數覆蓋的欄位應保留 YAML 值，實際 %d", tx.BusyRetryBackoffMS)
+		}
+	})
+}
+
+func TestRedactedIncludesTransactionSummary(t *testing.T) {
+	// 啟動摘要需可見交易邊界設定（不含機密），供運維核對實際生效值。
+	summary := Default().Redacted()
+	for _, want := range []string{"immediate", "reject", "10000", "schema_guard=startup"} {
+		if !strings.Contains(summary, want) {
+			t.Errorf("脫敏摘要應含交易設定 %q，實際: %s", want, summary)
+		}
+	}
+}
+
 func TestValidateSecurityHeaders(t *testing.T) {
 	cases := []struct {
 		name   string

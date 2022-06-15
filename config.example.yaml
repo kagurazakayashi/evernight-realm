@@ -25,6 +25,16 @@ server:
 database:
   path: "evernight.db"              # SQLite 檔案（相對 data_dir）
   busy_timeout_ms: 5000             # 鎖等待超時
+  preflight: "header"               # 開庫前預檢：header（檔頭標記，預設）| readonly（另加唯讀連線）| off（不預檢）
+  integrity_check: false            # 啟動時執行完整性自檢（大庫可能耗時）；亦可手動 `migrate --verify`
+  schema_guard: "startup"           # 寫入把關層級：startup（預設，僅啟動時拒絕不相容版本）| transaction（另於每個寫入交易前複驗 schema 版本）
+  # ---- 交易邊界（STEP-041）----
+  transaction:
+    begin_mode: "immediate"         # 寫入交易的 BEGIN 模式：immediate（預設，失敗點固定於交易開始前）| deferred
+    nested: "reject"                # 同一交易內再開交易：reject（預設）| savepoint（真嵌套）| reuse（加入外層）
+    busy_retry_max: 0               # 忙鎖時自動重試整個交易的次數（0 為預設，不重試；重試會重跑交易，需幂等）
+    busy_retry_backoff_ms: 50       # 重試線性退避基數（毫秒）
+    timeout_ms: 10000               # 單一交易執行期限（毫秒）；0 表示不限制
 
 # ---- 儲存目錄 ----
 media: "media/"                     # 媒體檔案

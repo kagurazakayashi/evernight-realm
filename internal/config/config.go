@@ -66,6 +66,42 @@ type ServerConfig struct {
 type DatabaseConfig struct {
 	Path          string `yaml:"path"`            // 資料庫檔名（相對資料目錄）
 	BusyTimeoutMS int    `yaml:"busy_timeout_ms"` // 鎖等待超時（毫秒）
+	// Preflight 為開庫前預檢模式（STEP-040）：
+	// header（預設）只讀檔頭標記，零寫入即可攔截非本服務檔與較新版本；
+	// readonly 另以唯讀連線讀取版本（可攔截檔頭落後的較新版本）；off 不預檢。
+	Preflight string `yaml:"preflight"`
+	// IntegrityCheck 為啟動時是否執行完整性自檢（integrity_check + foreign_key_check）。
+	// 預設關閉：大庫上自檢可能明顯耗時，需要時再開，或手動執行 `migrate --verify`。
+	IntegrityCheck bool `yaml:"integrity_check"`
+	// SchemaGuard 為不識別 schema 版本時的寫入把關層級（規格附錄 E.5）：
+	// startup（預設）於啟動時拒絕不相容版本；
+	// transaction 另於每個寫入交易的回呼執行前複驗版本（見 database.TxPolicy.GuardSchema），
+	// 可攔截執行期資料庫被替換或還原成其他版本。
+	SchemaGuard string `yaml:"schema_guard"`
+	// Transaction 為交易邊界行為（STEP-041）。
+	Transaction TransactionConfig `yaml:"transaction"`
+}
+
+// TransactionConfig 為交易邊界行為（STEP-041）。
+//
+// 回呼式交易由 database.InTx 提供：回呼回傳錯誤或 panic 時整體回滾。
+type TransactionConfig struct {
+	// BeginMode 為寫入交易的 BEGIN 模式：
+	// immediate（預設）在交易開始即取得寫入鎖，失敗點固定於交易開始前；
+	// deferred 則延到首次寫入才取得，失敗點落在回呼執行途中（不建議）。
+	BeginMode string `yaml:"begin_mode"`
+	// Nested 為同一交易內再開交易的行為：
+	// reject（預設）直接拒絕；savepoint 以儲存點實現真嵌套（內層可獨立回滾）；
+	// reuse 加入外層交易（內層失敗需由外層決定是否整體回滾）。
+	Nested string `yaml:"nested"`
+	// BusyRetryMax 為遇到忙鎖（SQLITE_BUSY/LOCKED）時自動重試整個交易的次數；
+	// 0（預設）不重試。重試會重跑回呼，故僅適用於幂等交易。
+	BusyRetryMax int `yaml:"busy_retry_max"`
+	// BusyRetryBackoffMS 為重試的線性退避基數（毫秒）；0 表示立即重試。
+	BusyRetryBackoffMS int `yaml:"busy_retry_backoff_ms"`
+	// TimeoutMS 為單一交易的執行期限（毫秒）；0 表示不限制。
+	// 短交易可避免長期持有寫入鎖（規格 RSK-003）。
+	TimeoutMS int `yaml:"timeout_ms"`
 }
 
 // LogsConfig 為本地日誌組態。
@@ -117,6 +153,15 @@ func Default() Config {
 		Database: DatabaseConfig{
 			Path:          "evernight.db",
 			BusyTimeoutMS: 5000,
+			Preflight:     "header",
+			SchemaGuard:   "startup",
+			Transaction: TransactionConfig{
+				BeginMode:          "immediate",
+				Nested:             "reject",
+				BusyRetryMax:       0,
+				BusyRetryBackoffMS: 50,
+				TimeoutMS:          10000,
+			},
 		},
 		Media:       "media/",
 		Documents:   "documents/",
@@ -253,6 +298,50 @@ func (c *Config) Validate() error {
 	if c.Database.BusyTimeoutMS < 1 {
 		return errors.New("config: database.busy_timeout_ms 必須為正整數（毫秒）")
 	}
+	// 預檢模式與寫入把關層級限枚舉值；空值代表採用內建預設（與 Default() 一致）。
+	if c.Database.Preflight == "" {
+		c.Database.Preflight = "header"
+	}
+	switch c.Database.Preflight {
+	case "header", "readonly", "off":
+	default:
+		return fmt.Errorf("config: database.preflight 需為 header|readonly|off，實際為 %q", c.Database.Preflight)
+	}
+	if c.Database.SchemaGuard == "" {
+		c.Database.SchemaGuard = "startup"
+	}
+	switch c.Database.SchemaGuard {
+	case "startup", "transaction":
+	default:
+		return fmt.Errorf("config: database.schema_guard 需為 startup|transaction，實際為 %q", c.Database.SchemaGuard)
+	}
+	// 交易邊界（STEP-041）：空值代表採用內建預設（與 Default() 一致）。
+	tx := &c.Database.Transaction
+	if tx.BeginMode == "" {
+		tx.BeginMode = "immediate"
+	}
+	switch tx.BeginMode {
+	case "immediate", "deferred":
+	default:
+		return fmt.Errorf("config: database.transaction.begin_mode 需為 immediate|deferred，實際為 %q", tx.BeginMode)
+	}
+	if tx.Nested == "" {
+		tx.Nested = "reject"
+	}
+	switch tx.Nested {
+	case "reject", "savepoint", "reuse":
+	default:
+		return fmt.Errorf("config: database.transaction.nested 需為 reject|savepoint|reuse，實際為 %q", tx.Nested)
+	}
+	if tx.BusyRetryMax < 0 {
+		return fmt.Errorf("config: database.transaction.busy_retry_max 不可為負數，實際為 %d", tx.BusyRetryMax)
+	}
+	if tx.BusyRetryBackoffMS < 0 {
+		return fmt.Errorf("config: database.transaction.busy_retry_backoff_ms 不可為負數，實際為 %d", tx.BusyRetryBackoffMS)
+	}
+	if tx.TimeoutMS < 0 {
+		return fmt.Errorf("config: database.transaction.timeout_ms 不可為負數（0 表示不限制），實際為 %d", tx.TimeoutMS)
+	}
 
 	for name, v := range map[string]string{
 		"media":       c.Media,
@@ -319,7 +408,7 @@ func (c Config) ListenAllInterfaces() bool {
 
 // Redacted 回傳組態的脫敏摘要（供啟動日誌），機密欄位一律顯示 [REDACTED]。
 func (c Config) Redacted() string {
-	return fmt.Sprintf("組態摘要：listen=%s data_dir=%s timezone=%s db=%s busy_timeout_ms=%d media=%s documents=%s attachments=%s backups=%s logs_dir=%s logs_level=%s session_ttl_hours=%d root_password_hash=%s http_timeouts_ms=[read_header=%d read=%d write=%d idle=%d request=%d shutdown=%d] max_body_bytes=%d security_headers=[frame_options=%s csp=%s referrer_policy=%s permissions_policy=%s]",
+	return fmt.Sprintf("組態摘要：listen=%s data_dir=%s timezone=%s db=%s busy_timeout_ms=%d media=%s documents=%s attachments=%s backups=%s logs_dir=%s logs_level=%s session_ttl_hours=%d root_password_hash=%s http_timeouts_ms=[read_header=%d read=%d write=%d idle=%d request=%d shutdown=%d] max_body_bytes=%d security_headers=[frame_options=%s csp=%s referrer_policy=%s permissions_policy=%s] tx=[begin_mode=%s nested=%s busy_retry_max=%d busy_retry_backoff_ms=%d timeout_ms=%d schema_guard=%s]",
 		c.Server.Listen, c.Server.DataDir, c.Server.DisplayTimezone,
 		c.Database.Path, c.Database.BusyTimeoutMS,
 		c.Media, c.Documents, c.Attachments, c.Backups,
@@ -330,7 +419,10 @@ func (c Config) Redacted() string {
 		orDefault(c.Security.Headers.FrameOptions, "DENY"),
 		presence(c.Security.Headers.ContentSecurityPolicy),
 		presence(c.Security.Headers.ReferrerPolicy),
-		presence(c.Security.Headers.PermissionsPolicy))
+		presence(c.Security.Headers.PermissionsPolicy),
+		c.Database.Transaction.BeginMode, c.Database.Transaction.Nested,
+		c.Database.Transaction.BusyRetryMax, c.Database.Transaction.BusyRetryBackoffMS,
+		c.Database.Transaction.TimeoutMS, c.Database.SchemaGuard)
 }
 
 // presence 將安全回應頭的覆寫值表示為「自訂」或「(預設)」，避免摘要輸出整段策略。
@@ -369,6 +461,8 @@ func applyEnv(cfg *Config) error {
 		{&cfg.Server.DataDir, "ER_SERVER_DATA_DIR"},
 		{&cfg.Server.DisplayTimezone, "ER_SERVER_DISPLAY_TIMEZONE"},
 		{&cfg.Database.Path, "ER_DATABASE_PATH"},
+		{&cfg.Database.Transaction.BeginMode, "ER_DATABASE_TRANSACTION_BEGIN_MODE"},
+		{&cfg.Database.Transaction.Nested, "ER_DATABASE_TRANSACTION_NESTED"},
 		{&cfg.Media, "ER_MEDIA"},
 		{&cfg.Documents, "ER_DOCUMENTS"},
 		{&cfg.Attachments, "ER_ATTACHMENTS"},
@@ -393,6 +487,9 @@ func applyEnv(cfg *Config) error {
 	}
 	ints := []intField{
 		{&cfg.Database.BusyTimeoutMS, "ER_DATABASE_BUSY_TIMEOUT_MS"},
+		{&cfg.Database.Transaction.BusyRetryMax, "ER_DATABASE_TRANSACTION_BUSY_RETRY_MAX"},
+		{&cfg.Database.Transaction.BusyRetryBackoffMS, "ER_DATABASE_TRANSACTION_BUSY_RETRY_BACKOFF_MS"},
+		{&cfg.Database.Transaction.TimeoutMS, "ER_DATABASE_TRANSACTION_TIMEOUT_MS"},
 		{&cfg.Security.SessionTTLHours, "ER_SECURITY_SESSION_TTL_HOURS"},
 		{&cfg.Server.ReadHeaderTimeoutMS, "ER_SERVER_READ_HEADER_TIMEOUT_MS"},
 		{&cfg.Server.ReadTimeoutMS, "ER_SERVER_READ_TIMEOUT_MS"},

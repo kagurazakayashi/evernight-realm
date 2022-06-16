@@ -17,6 +17,7 @@ import (
 	"time"
 
 	"github.com/kagurazakayashi/evernight-realm/internal/config"
+	"github.com/kagurazakayashi/evernight-realm/internal/idgen"
 )
 
 // Server 為 HTTP 服務層。
@@ -27,6 +28,9 @@ type Server struct {
 	httpSrv *http.Server
 	// secHeaders 為啟動時算好的安全回應頭（組態留空時為內建基線）。
 	secHeaders securityHeaderSet
+	// newID 為伺服器側標識的產生器，固定為 idgen.New（全服務唯一產生點）；
+	// 以欄位持有是為了讓測試能注入失敗情境，驗證該路徑不降級而是拒絕請求。
+	newID func() (idgen.ID, error)
 }
 
 // New 以組態與版本字串建立 HTTP 服務層；伺服器端日誌固定寫往標準錯誤輸出。
@@ -36,6 +40,7 @@ func New(cfg *config.Config, version string) *Server {
 		version:    version,
 		logger:     log.New(os.Stderr, "evernight-server ", log.LstdFlags),
 		secHeaders: buildSecurityHeaders(cfg),
+		newID:      idgen.New,
 	}
 	s.httpSrv = &http.Server{
 		Addr:    cfg.Server.Listen,
@@ -63,9 +68,12 @@ func (s *Server) Handler() http.Handler {
 }
 
 // wrap 為路由樹套上完整中介層鏈（測試亦以本方法組裝，確保與正式路徑一致）。
-// 中介層由外而內為：請求關聯 ID → 安全回應頭 → panic 恢復 → 處理期限 → 請求體上限 → 路由。
+// 中介層由外而內為：安全回應頭 → 請求關聯 ID → panic 恢復 → 處理期限 → 請求體上限 → 路由。
+//
+// 安全回應頭固定最外層，讓鏈上任何一層自行寫出的回應（含無法產生關聯 ID 時的拒絕）
+// 都帶著標頭，不外洩未受保護的回應。
 func (s *Server) wrap(h http.Handler) http.Handler {
-	return chain(h, withRequestID, s.withSecurityHeaders, s.withRecovery, s.withTimeout, s.withBodyLimit)
+	return chain(h, s.withSecurityHeaders, s.withRequestID, s.withRecovery, s.withTimeout, s.withBodyLimit)
 }
 
 // registerRoutes 集中登記路由；未登記的路徑與不支援的方法都回傳統一錯誤信封。

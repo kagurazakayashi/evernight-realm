@@ -3,6 +3,7 @@ package httpapi
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"io"
 	"log"
 	"net/http"
@@ -10,8 +11,8 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/google/uuid"
 	"github.com/kagurazakayashi/evernight-realm/internal/config"
+	"github.com/kagurazakayashi/evernight-realm/internal/idgen"
 )
 
 // decodeEnvelope 讀取回應並解析為統一錯誤信封，同時回傳原始回應內容。
@@ -157,14 +158,79 @@ func TestRequestIDRejectsUnsafeValue(t *testing.T) {
 			if got == unsafe {
 				t.Fatalf("不安全的 %s 不應被透傳: %q", requestIDHeader, got)
 			}
-			parsed, err := uuid.Parse(got)
-			if err != nil {
-				t.Fatalf("應改以合法 UUID 產生關聯 ID，實際 %q: %v", got, err)
-			}
-			if parsed.Version() != 7 {
-				t.Errorf("產生的關聯 ID 應為 UUIDv7，實際版本 %d", parsed.Version())
+			if _, err := idgen.Parse(got); err != nil {
+				t.Fatalf("應改以統一介面產生正規 UUIDv7 關聯 ID，實際 %q: %v", got, err)
 			}
 		})
+	}
+}
+
+// TestServerGeneratedRequestIDUsesIDGen 驗證伺服器自行產生的關聯 ID 一律經統一介面：
+// 格式為正規 UUIDv7，且依產生順序可排序（排序欄位為前 8 個位元組）。
+func TestServerGeneratedRequestIDUsesIDGen(t *testing.T) {
+	ts := testServer(t)
+	var orderPrefixes []string
+	for range 5 {
+		resp, err := http.Get(ts.URL + "/health")
+		if err != nil {
+			t.Fatalf("GET /health 失敗: %v", err)
+		}
+		defer resp.Body.Close()
+
+		id, err := idgen.Parse(resp.Header.Get(requestIDHeader))
+		if err != nil {
+			t.Fatalf("關聯 ID %q 應可經統一介面解析: %v", resp.Header.Get(requestIDHeader), err)
+		}
+		orderPrefixes = append(orderPrefixes, strings.ReplaceAll(id.String(), "-", "")[:16])
+	}
+	for i := 1; i < len(orderPrefixes); i++ {
+		if orderPrefixes[i-1] >= orderPrefixes[i] {
+			t.Errorf("後產生的關聯 ID 排序前綴應較大：%s 之後是 %s", orderPrefixes[i-1], orderPrefixes[i])
+		}
+	}
+}
+
+// TestRequestIDGenerationFailureRejectsRequest 驗證亂數來源異常時不降級：
+// 無法產生關聯 ID 即以統一信封回 500，不輸出其他格式頂替，原因只寫伺服器端日誌。
+func TestRequestIDGenerationFailureRejectsRequest(t *testing.T) {
+	const cause = "熵源不可用"
+	var logBuf bytes.Buffer
+	cfg := config.Default()
+	srv := New(&cfg, testVersion)
+	srv.logger = log.New(&logBuf, "", 0)
+	srv.newID = func() (idgen.ID, error) { return idgen.Nil, errors.New(cause) }
+
+	ts := httptest.NewServer(srv.Handler())
+	defer ts.Close()
+
+	resp, err := http.Get(ts.URL + "/health")
+	if err != nil {
+		t.Fatalf("請求失敗: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusInternalServerError {
+		t.Fatalf("無法產生關聯 ID 應回 500，實際 %d", resp.StatusCode)
+	}
+	if got := resp.Header.Get(requestIDHeader); got != "" {
+		t.Errorf("不應以其他格式頂替關聯 ID，實際 %q", got)
+	}
+
+	envelope, body := decodeEnvelope(t, resp)
+	if envelope.Code != CodeUnknown {
+		t.Errorf("錯誤碼應為 %d，實際 %d", CodeUnknown, envelope.Code)
+	}
+	if envelope.RequestID != "" {
+		t.Errorf("信封 request_id 應留空（關聯 ID 無法產生），實際 %q", envelope.RequestID)
+	}
+	if strings.Contains(string(body), cause) {
+		t.Errorf("回應不得洩漏底層錯誤原因: %s", body)
+	}
+	if logged := logBuf.String(); !strings.Contains(logged, cause) || !strings.Contains(logged, "/health") {
+		t.Errorf("伺服器端日誌應保留失敗原因與請求路徑: %s", logged)
+	}
+	// 本層自行寫出的拒絕回應仍須帶完整安全標頭（安全標頭中介層位於鏈最外層）。
+	if resp.Header.Get("Content-Security-Policy") == "" {
+		t.Error("拒絕回應缺少安全標頭")
 	}
 }
 
@@ -200,7 +266,7 @@ func TestPanicRecoveryReturnsEnvelopeAndLogsID(t *testing.T) {
 	panicking := http.HandlerFunc(func(http.ResponseWriter, *http.Request) {
 		panic(secret)
 	})
-	ts := httptest.NewServer(chain(panicking, withRequestID, srv.withRecovery))
+	ts := httptest.NewServer(chain(panicking, srv.withRequestID, srv.withRecovery))
 	defer ts.Close()
 
 	resp, err := http.Get(ts.URL + "/panic")
@@ -237,7 +303,7 @@ func TestPanicRecoveryRepanicsAbortHandler(t *testing.T) {
 	aborting := http.HandlerFunc(func(http.ResponseWriter, *http.Request) {
 		panic(http.ErrAbortHandler)
 	})
-	handler := chain(aborting, withRequestID, srv.withRecovery)
+	handler := chain(aborting, srv.withRequestID, srv.withRecovery)
 
 	defer func() {
 		if recovered := recover(); recovered != http.ErrAbortHandler {

@@ -4,8 +4,6 @@ import (
 	"context"
 	"net/http"
 	"runtime/debug"
-
-	"github.com/google/uuid"
 )
 
 // requestIDHeader 為請求關聯 ID 的標頭名稱：用戶端可帶入以自行關聯，回應一律回傳。
@@ -31,18 +29,11 @@ func chain(h http.Handler, middlewares ...middleware) http.Handler {
 	return h
 }
 
-// newRequestID 產生請求關聯 ID：UUIDv7 字串，可依時間排序，便於日誌比對。
-func newRequestID() string {
-	id, err := uuid.NewV7()
-	if err != nil {
-		// 亂數來源異常時退而以 UUIDv4 產生，仍保持唯一性。
-		return uuid.NewString()
-	}
-	return id.String()
-}
-
 // validRequestID 檢查用戶端帶入的關聯 ID 是否可安全透傳。
 // 只接受長度受限的 [A-Za-z0-9._-]，避免控制字元造成標頭或日誌注入。
+//
+// 這裡刻意不以 idgen.Parse 判定：關聯 ID 由用戶端自行選定、只用於比對其自身日誌，
+// 不是內部實體主鍵；只有「改由伺服器產生」時才一律經 idgen。
 func validRequestID(id string) bool {
 	if id == "" || len(id) > requestIDMaxLen {
 		return false
@@ -58,13 +49,22 @@ func validRequestID(id string) bool {
 	return true
 }
 
-// withRequestID 為每個請求決定關聯 ID：沿用用戶端合法值，否則自行產生。
+// withRequestID 為每個請求決定關聯 ID：沿用用戶端合法值，否則經 idgen 產生 UUIDv7。
 // ID 同時放入回應標頭與請求 context，供錯誤信封與伺服器端日誌使用。
-func withRequestID(next http.Handler) http.Handler {
+//
+// 產生失敗時不降級為其他版本或隨機字串（協議要求伺服器產生的 ID 恆為 UUIDv7），
+// 改以統一錯誤信封拒絕本次請求，原因只寫伺服器端日誌。
+func (s *Server) withRequestID(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		id := r.Header.Get(requestIDHeader)
 		if !validRequestID(id) {
-			id = newRequestID()
+			gen, err := s.newID()
+			if err != nil {
+				s.logger.Printf("產生請求關聯 ID 失敗：method=%s path=%s err=%v", r.Method, r.URL.Path, err)
+				writeError(w, r, CodeUnknown, http.StatusInternalServerError)
+				return
+			}
+			id = gen.String()
 		}
 		w.Header().Set(requestIDHeader, id)
 		next.ServeHTTP(w, r.WithContext(context.WithValue(r.Context(), requestIDCtxKey, id)))

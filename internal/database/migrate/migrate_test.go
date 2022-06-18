@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/kagurazakayashi/evernight-realm/internal/database"
+	"github.com/kagurazakayashi/evernight-realm/internal/timeutil"
 )
 
 // mustOpen 開啟指定路徑的測試資料庫（含單寫入實例鎖）。
@@ -170,6 +171,74 @@ func TestApplyOnEmptyDatabase(t *testing.T) {
 	}
 	if current != res.ToVersion {
 		t.Errorf("Current 應為 %d，實際 %d", res.ToVersion, current)
+	}
+}
+
+// TestApplyUsesInjectedClock 驗證版本記錄的時間戳取自注入的時鐘而非系統牆鐘：
+// 業務時間必須可注入，後續交易、Pending 與排程的判定才能被確定性地驗證（規格 §27.2）。
+func TestApplyUsesInjectedClock(t *testing.T) {
+	ctx := context.Background()
+	clock := timeutil.NewTest(time.Date(2026, 9, 25, 12, 34, 56, 789_000_000, time.UTC))
+
+	poolFirst, _ := openTestDB(t)
+	res, err := Apply(ctx, poolFirst, Options{Clock: clock})
+	if err != nil {
+		t.Fatalf("注入時鐘套用遷移失敗: %v", err)
+	}
+	if len(res.Applied) == 0 {
+		t.Fatal("本測試需要有待套用的遷移")
+	}
+	assertAppliedAt(t, ctx, poolFirst, timeutil.ToMillis(clock.Now()))
+
+	// 推進時鐘後套用到另一個空白庫：時間戳隨之改變，證明取值發生在套用當下而非建立時鐘時。
+	clock.Advance(time.Minute)
+	poolSecond, _ := openTestDB(t)
+	if _, err := Apply(ctx, poolSecond, Options{Clock: clock}); err != nil {
+		t.Fatalf("推進時鐘後套用遷移失敗: %v", err)
+	}
+	assertAppliedAt(t, ctx, poolSecond, timeutil.ToMillis(clock.Now()))
+}
+
+// assertAppliedAt 確認版本表每一筆的原始欄位（Unix 毫秒整數）與讀回值都等於毫秒值。
+func assertAppliedAt(t *testing.T, ctx context.Context, pool *sql.DB, millis int64) {
+	t.Helper()
+
+	rows, err := pool.QueryContext(ctx, "SELECT version, applied_at FROM "+TableName+" ORDER BY version")
+	if err != nil {
+		t.Fatalf("讀取原始版本表失敗: %v", err)
+	}
+	defer rows.Close()
+
+	count := 0
+	for rows.Next() {
+		var version int
+		var got int64
+		if err := rows.Scan(&version, &got); err != nil {
+			t.Fatalf("解析原始版本表失敗: %v", err)
+		}
+		count++
+		if got != millis {
+			t.Errorf("版本 %d 的 applied_at 應為注入時鐘的 %d 毫秒，實際 %d", version, millis, got)
+		}
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatalf("讀取原始版本表失敗: %v", err)
+	}
+	if count == 0 {
+		t.Fatal("版本表不應為空")
+	}
+
+	applied, err := loadApplied(ctx, pool)
+	if err != nil {
+		t.Fatalf("讀取版本表失敗: %v", err)
+	}
+	for _, a := range applied {
+		if a.AppliedAt.UnixMilli() != millis {
+			t.Errorf("版本 %d 讀回的時間應為 %d 毫秒，實際 %v", a.Version, millis, a.AppliedAt)
+		}
+		if _, offset := a.AppliedAt.Zone(); offset != 0 {
+			t.Errorf("版本 %d 讀回的時間應為 UTC，實際區偏移 %d 秒", a.Version, offset)
+		}
 	}
 }
 

@@ -18,6 +18,7 @@ import (
 	"github.com/kagurazakayashi/evernight-realm/internal/database"
 	"github.com/kagurazakayashi/evernight-realm/internal/database/migrate"
 	"github.com/kagurazakayashi/evernight-realm/internal/httpapi"
+	"github.com/kagurazakayashi/evernight-realm/internal/timeutil"
 )
 
 // Version 為目前開發版本。正式版號策略待發布流程定案後統一管理。
@@ -68,7 +69,7 @@ func Migrate(ctx context.Context, args []string, out io.Writer) error {
 		fmt.Fprintln(out, "資料庫自檢：integrity_check=ok，foreign_key_check=無違規")
 		dryRun = true
 	}
-	res, err := migrate.Apply(ctx, db.SQL(), migrate.Options{DryRun: dryRun})
+	res, err := migrate.Apply(ctx, db.SQL(), migrate.Options{DryRun: dryRun, Clock: timeutil.System()})
 	if err != nil {
 		return err
 	}
@@ -228,7 +229,8 @@ func run(ctx context.Context, releaseSignals func(), args []string, out io.Write
 		}
 		fmt.Fprintln(out, "資料庫完整性自檢：integrity_check=ok，foreign_key_check=無違規")
 	}
-	res, err := migrate.Apply(ctx, db.SQL(), migrate.Options{})
+	// 遷移記錄的時間戳取自伺服器時鐘；業務時間不得取自請求內容（規格 §27.2）。
+	res, err := migrate.Apply(ctx, db.SQL(), migrate.Options{Clock: timeutil.System()})
 	if err != nil {
 		return err
 	}
@@ -238,7 +240,8 @@ func run(ctx context.Context, releaseSignals func(), args []string, out io.Write
 
 	// 先建立監聽器再輸出啟動資訊：連接埠被佔用等失敗直接回報，
 	// 且輸出的是實際監聽地址（監聽埠設為 0 時可見系統指派的埠號）。
-	srv := httpapi.New(&cfg, Version)
+	// 就緒與否以資料庫能否回應為準；業務時間一律取自伺服器時鐘。
+	srv := httpapi.New(&cfg, Version, httpapi.Deps{Ready: db.Ping, Clock: timeutil.System()})
 	ln, err := srv.Listen()
 	if err != nil {
 		return err
@@ -258,7 +261,7 @@ func run(ctx context.Context, releaseSignals func(), args []string, out io.Write
 	if cfg.ListenAllInterfaces() {
 		fmt.Fprintln(out, "風險提示：監聽地址暴露於所有介面（含公網網卡），請確認防火牆與部署範圍。")
 	}
-	fmt.Fprintf(out, "HTTP 服務已啟動：http://%s （/health 為存活檢查）\n", ln.Addr())
+	fmt.Fprintf(out, "HTTP 服務已啟動：http://%s （/health 存活、/ready 就緒、/time 伺服器時間）\n", ln.Addr())
 
 	serveErr := make(chan error, 1)
 	go func() { serveErr <- srv.Serve(ln) }()

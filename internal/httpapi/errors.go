@@ -26,6 +26,8 @@ const (
 	CodeUnsupportedMediaType ErrorCode = 1005
 	// CodeRequestTimeout 表示處理超過 server.request_timeout_ms 期限。
 	CodeRequestTimeout ErrorCode = 1006
+	// CodeNotReady 表示服務尚未就緒（依賴的資料庫無法回應），業務操作暫不可執行。
+	CodeNotReady ErrorCode = 1007
 )
 
 // ErrorEnvelope 是所有錯誤回應的統一信封，也是錯誤回應格式的唯一權威定義。

@@ -9,7 +9,7 @@
 // 記錄於版本表，改寫會被拒絕（改寫會使既有資料庫與執行檔對不上）。
 // 遷移僅前向；回滾一律以備份還原，不得刪除遷移記錄（規格附錄 E.5）。
 //
-// 本套件只依賴 database/sql，不依賴 internal/database，
+// 本套件只依賴 database/sql 與內部時間工具（internal/timeutil），不依賴 internal/database，
 // 以便資料庫引擎與遷移器保持單向關係（由啟動流程負責串接）。
 package migrate
 
@@ -28,6 +28,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/kagurazakayashi/evernight-realm/internal/timeutil"
 )
 
 //go:embed migrations/*.sql
@@ -99,8 +101,9 @@ type Applied struct {
 type Options struct {
 	// DryRun 為 true 時只檢查版本與待套用清單，完全不變更資料庫。
 	DryRun bool
-	// Now 提供時間來源；nil 表示使用系統 UTC 時間。
-	Now func() time.Time
+	// Clock 為版本記錄時間戳的來源；nil 表示使用伺服器系統時鐘。
+	// 注入 timeutil.NewTest 可使套用時間成為可斷言的固定值。
+	Clock timeutil.Clock
 }
 
 // Result 為一次 Apply 的結果。
@@ -298,12 +301,12 @@ func applySet(ctx context.Context, db *sql.DB, known []Migration, opts Options) 
 		return res, err
 	}
 
-	now := time.Now().UTC
-	if opts.Now != nil {
-		now = opts.Now
+	clock := opts.Clock
+	if clock == nil {
+		clock = timeutil.System()
 	}
 	for _, m := range res.Pending {
-		if err := applyOne(ctx, db, m, now()); err != nil {
+		if err := applyOne(ctx, db, m, clock.Now()); err != nil {
 			return res, err
 		}
 		res.Applied = append(res.Applied, m)
@@ -333,7 +336,7 @@ func applyOne(ctx context.Context, db *sql.DB, m Migration, at time.Time) error 
 	}
 	if _, err := tx.ExecContext(ctx,
 		"INSERT INTO "+TableName+" (version, name, checksum, applied_at) VALUES (?, ?, ?, ?)",
-		m.Version, m.Name, m.Checksum, at.UnixMilli()); err != nil {
+		m.Version, m.Name, m.Checksum, timeutil.ToMillis(at)); err != nil {
 		return fmt.Errorf("migrate: 寫入版本記錄失敗（%s，已整體回滾）: %w", m, err)
 	}
 	if err := tx.Commit(); err != nil {
@@ -364,7 +367,7 @@ func loadApplied(ctx context.Context, db *sql.DB) ([]Applied, error) {
 		if err := rows.Scan(&a.Version, &a.Name, &a.Checksum, &appliedAt); err != nil {
 			return nil, fmt.Errorf("migrate: 解析版本表失敗: %w", err)
 		}
-		a.AppliedAt = time.UnixMilli(appliedAt).UTC()
+		a.AppliedAt = timeutil.FromMillis(appliedAt)
 		applied = append(applied, a)
 	}
 	if err := rows.Err(); err != nil {

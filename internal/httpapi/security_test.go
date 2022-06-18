@@ -83,7 +83,7 @@ func TestSecurityHeadersOnSuccessAndErrorResponses(t *testing.T) {
 
 	t.Run("panic 回應", func(t *testing.T) {
 		cfg := config.Default()
-		srv := New(&cfg, testVersion)
+		srv := New(&cfg, testVersion, Deps{})
 		srv.logger = log.New(io.Discard, "", 0)
 		mux := http.NewServeMux()
 		mux.HandleFunc("/panic", func(http.ResponseWriter, *http.Request) { panic("boom") })
@@ -199,7 +199,7 @@ func TestSecurityHeadersFromConfig(t *testing.T) {
 	cfg.Security.Headers.FrameOptions = customFrame
 	cfg.Security.Headers.ReferrerPolicy = customReferer
 	cfg.Security.Headers.PermissionsPolicy = customPerms
-	srv := New(&cfg, testVersion)
+	srv := New(&cfg, testVersion, Deps{})
 
 	mux := http.NewServeMux()
 	srv.registerRoutes(mux)
@@ -230,7 +230,7 @@ func TestSecurityHeadersFromConfig(t *testing.T) {
 
 func TestHSTSOnlyOnTLSConnections(t *testing.T) {
 	cfg := config.Default()
-	srv := New(&cfg, testVersion)
+	srv := New(&cfg, testVersion, Deps{})
 	mux := http.NewServeMux()
 	srv.registerRoutes(mux)
 

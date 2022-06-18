@@ -5,6 +5,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
 // 寫入臨時組態檔並回傳路徑。
@@ -438,6 +439,45 @@ func TestValidateBadTimezone(t *testing.T) {
 	err := cfg.Validate()
 	if err == nil || !strings.Contains(err.Error(), "display_timezone") {
 		t.Errorf("非法時區應指出 display_timezone，實際: %v", err)
+	}
+}
+
+// TestDisplayLocation 驗證顯示時區的解析與「當刻」偏移：偏移必須隨該時刻的日光節約
+// 狀態改變，否則下發給客戶端的偏移會在半年內把顯示時間錯開一小時。
+func TestDisplayLocation(t *testing.T) {
+	january := time.Date(2026, 1, 15, 12, 0, 0, 0, time.UTC)
+	july := time.Date(2026, 7, 15, 12, 0, 0, 0, time.UTC)
+
+	cases := []struct {
+		name       string
+		timezone   string
+		at         time.Time
+		wantOffset int
+	}{
+		{"無 daylight saving 的亞洲時區", "Asia/Shanghai", january, 8 * 3600},
+		{"同一時區全年偏移相同", "Asia/Shanghai", july, 8 * 3600},
+		{"紐約冬季 -05:00", "America/New_York", january, -5 * 3600},
+		{"紐約夏季 -04:00（日光節約）", "America/New_York", july, -4 * 3600},
+		{"UTC", "UTC", january, 0},
+		{"空白名稱視為 UTC", "", january, 0},
+		{"非法名稱回退 UTC", "Not/AZone", january, 0},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := Default()
+			cfg.Server.DisplayTimezone = tc.timezone
+
+			_, offset := tc.at.In(cfg.DisplayLocation()).Zone()
+			if offset != tc.wantOffset {
+				t.Errorf("時區 %q 在 %v 的偏移應為 %d 秒，實際 %d 秒", tc.timezone, tc.at, tc.wantOffset, offset)
+			}
+		})
+	}
+
+	// 零值組態（未經 Default）也不得回傳 nil，否則呼叫端換算偏移時會 panic。
+	var zero Config
+	if loc := zero.DisplayLocation(); loc == nil {
+		t.Fatal("零值組態的顯示時區不得為 nil")
 	}
 }
 

@@ -196,7 +196,7 @@ func TestRequestIDGenerationFailureRejectsRequest(t *testing.T) {
 	const cause = "熵源不可用"
 	var logBuf bytes.Buffer
 	cfg := config.Default()
-	srv := New(&cfg, testVersion)
+	srv := New(&cfg, testVersion, Deps{})
 	srv.logger = log.New(&logBuf, "", 0)
 	srv.newID = func() (idgen.ID, error) { return idgen.Nil, errors.New(cause) }
 
@@ -260,7 +260,7 @@ func TestPanicRecoveryReturnsEnvelopeAndLogsID(t *testing.T) {
 	const secret = "panic-detail-should-not-leak"
 	var logBuf bytes.Buffer
 	cfg := config.Default()
-	srv := New(&cfg, testVersion)
+	srv := New(&cfg, testVersion, Deps{})
 	srv.logger = log.New(&logBuf, "", 0)
 
 	panicking := http.HandlerFunc(func(http.ResponseWriter, *http.Request) {
@@ -298,7 +298,7 @@ func TestPanicRecoveryReturnsEnvelopeAndLogsID(t *testing.T) {
 
 func TestPanicRecoveryRepanicsAbortHandler(t *testing.T) {
 	cfg := config.Default()
-	srv := New(&cfg, testVersion)
+	srv := New(&cfg, testVersion, Deps{})
 
 	aborting := http.HandlerFunc(func(http.ResponseWriter, *http.Request) {
 		panic(http.ErrAbortHandler)

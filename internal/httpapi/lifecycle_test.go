@@ -18,7 +18,7 @@ func lifecycleServer(t *testing.T, mux *http.ServeMux, shutdownTimeoutMS int) (*
 	cfg := config.Default()
 	cfg.Server.Listen = "127.0.0.1:0"
 	cfg.Server.ShutdownTimeoutMS = shutdownTimeoutMS
-	srv := New(&cfg, testVersion)
+	srv := New(&cfg, testVersion, Deps{})
 	srv.httpSrv.Handler = srv.wrap(mux)
 
 	ln, err := srv.Listen()
@@ -62,7 +62,7 @@ func assertPortReleased(t *testing.T, addr string) {
 func TestShutdownTimeoutFromConfig(t *testing.T) {
 	cfg := config.Default()
 	cfg.Server.ShutdownTimeoutMS = 2500
-	srv := New(&cfg, testVersion)
+	srv := New(&cfg, testVersion, Deps{})
 	if got := srv.ShutdownTimeout(); got != 2500*time.Millisecond {
 		t.Fatalf("ShutdownTimeout 應為 2.5s，實際 %v", got)
 	}

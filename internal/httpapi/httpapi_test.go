@@ -20,7 +20,7 @@ const testVersion = "0.1.0-test"
 func testServer(t *testing.T) *httptest.Server {
 	t.Helper()
 	cfg := config.Default()
-	srv := New(&cfg, testVersion)
+	srv := New(&cfg, testVersion, Deps{})
 	ts := httptest.NewServer(srv.Handler())
 	t.Cleanup(ts.Close)
 	return ts
@@ -84,7 +84,7 @@ func TestServeWithConfiguredPort(t *testing.T) {
 
 	cfg := config.Default()
 	cfg.Server.Listen = fmt.Sprintf("127.0.0.1:%d", port)
-	srv := New(&cfg, testVersion)
+	srv := New(&cfg, testVersion, Deps{})
 	serverLn, err := srv.Listen()
 	if err != nil {
 		t.Fatalf("Listen 失敗: %v", err)
@@ -129,7 +129,7 @@ func TestListenPortInUse(t *testing.T) {
 
 	cfg := config.Default()
 	cfg.Server.Listen = fmt.Sprintf("127.0.0.1:%d", port)
-	srv := New(&cfg, testVersion)
+	srv := New(&cfg, testVersion, Deps{})
 	_, err = srv.Listen()
 	if err == nil {
 		t.Fatal("連接埠被佔用時 Listen 應回傳錯誤")

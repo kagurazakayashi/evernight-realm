@@ -27,7 +27,7 @@ func newTestJSONServer(t *testing.T, mutate func(*config.Config)) *httptest.Serv
 	if mutate != nil {
 		mutate(&cfg)
 	}
-	srv := New(&cfg, testVersion)
+	srv := New(&cfg, testVersion, Deps{})
 	srv.logger = log.New(io.Discard, "", 0)
 
 	mux := http.NewServeMux()
@@ -63,7 +63,7 @@ func postBody(t *testing.T, url, contentType, body string) *http.Response {
 
 func TestServerTimeoutsAndHeaderLimitApplied(t *testing.T) {
 	cfg := config.Default()
-	srv := New(&cfg, testVersion)
+	srv := New(&cfg, testVersion, Deps{})
 
 	if srv.httpSrv.ReadHeaderTimeout != time.Duration(cfg.Server.ReadHeaderTimeoutMS)*time.Millisecond {
 		t.Errorf("ReadHeaderTimeout 應取自組態，實際 %s", srv.httpSrv.ReadHeaderTimeout)
@@ -173,6 +173,40 @@ func TestDecodeJSONRejectsUnknownField(t *testing.T) {
 	}
 }
 
+// TestDecodeJSONRejectsClientSuppliedTime 驗證客戶端無法把「當前時間」塞進請求體：
+// 請求結構不含任何時間欄位，自行加上的時間欄位一律當成未知欄位拒絕——
+// 業務時間只能取自伺服器時鐘（規格 §27.2、SYS-006、ADR-007）。
+func TestDecodeJSONRejectsClientSuppliedTime(t *testing.T) {
+	cases := []struct {
+		name  string
+		body  string
+		field string
+	}{
+		{"now", `{"name":"a","count":1,"now":"2020-01-01T00:00:00Z"}`, "now"},
+		{"server_time（毫秒整數）", `{"name":"a","count":1,"server_time":1577836800000}`, "server_time"},
+		{"timestamp（帶偏移寫法）", `{"name":"a","count":1,"timestamp":"2020-01-01T08:00:00+08:00"}`, "timestamp"},
+		{"created_at", `{"created_at":"2020-01-01T00:00:00.000Z","name":"a","count":1}`, "created_at"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			ts := newTestJSONServer(t, nil)
+			resp := postBody(t, ts.URL+"/json", "application/json", tc.body)
+			defer resp.Body.Close()
+
+			if resp.StatusCode != http.StatusBadRequest {
+				t.Fatalf("客戶端提交的時間欄位應得 400，實際 %d", resp.StatusCode)
+			}
+			envelope, _ := decodeEnvelope(t, resp)
+			if envelope.Code != CodeInvalidBody {
+				t.Errorf("錯誤碼應為 %d，實際 %d", CodeInvalidBody, envelope.Code)
+			}
+			if envelope.Details["reason"] != "unknown field" || envelope.Details["field"] != tc.field {
+				t.Errorf("細節應指出未知欄位 %q，實際 %v", tc.field, envelope.Details)
+			}
+		})
+	}
+}
+
 func TestDecodeJSONRejectsTypeMismatch(t *testing.T) {
 	ts := newTestJSONServer(t, nil)
 	resp := postBody(t, ts.URL+"/json", "application/json", `{"name":"a","count":"三"}`)
@@ -242,7 +276,7 @@ func TestRequestTimeoutReturnsStableError(t *testing.T) {
 	var logBuf bytes.Buffer
 	cfg := config.Default()
 	cfg.Server.RequestTimeoutMS = 50
-	srv := New(&cfg, testVersion)
+	srv := New(&cfg, testVersion, Deps{})
 	srv.logger = log.New(&logBuf, "", 0)
 
 	mux := http.NewServeMux()

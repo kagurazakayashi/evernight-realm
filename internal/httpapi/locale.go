@@ -66,6 +66,12 @@ var errorMessages = map[ErrorCode]map[string]string{
 		LocaleEnUS: "The server timed out while processing the request. Please try again.",
 		LocaleJaJP: "サーバーがリクエストの処理中にタイムアウトしました。しばらくしてからお試しください。",
 	},
+	CodeNotReady: {
+		LocaleZhCN: "服务尚未就绪，暂时无法处理业务操作，请稍后重试。",
+		LocaleZhTW: "服務尚未就緒，暫時無法處理業務操作，請稍後重試。",
+		LocaleEnUS: "The service is not ready yet and cannot handle business operations. Please try again later.",
+		LocaleJaJP: "サービスはまだ準備ができておらず、操作を処理できません。しばらくしてからもう一度お試しください。",
+	},
 }
 
 // messageFor 取得錯誤碼在指定語言的使用者訊息；語言未支援或訊息為空時回退 defaultLocale。

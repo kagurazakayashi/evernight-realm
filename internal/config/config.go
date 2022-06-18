@@ -406,6 +406,18 @@ func (c Config) ListenAllInterfaces() bool {
 	return host == "0.0.0.0" || host == "::" || host == "[::]"
 }
 
+// DisplayLocation 回傳解析後的顯示時區，供時刻換算 UTC 偏移使用。
+//
+// 組態以 IANA 名稱儲存（Validate 已校驗其合法性），資料庫與協議一律以 UTC 存取，
+// 本方法只負責「顯示」這一層：名稱無法解析時回退 UTC，
+// 讓未經校驗的組態（如測試直接構造的零值）也有確定的行為。
+func (c Config) DisplayLocation() *time.Location {
+	if loc, err := time.LoadLocation(c.Server.DisplayTimezone); err == nil {
+		return loc
+	}
+	return time.UTC
+}
+
 // Redacted 回傳組態的脫敏摘要（供啟動日誌），機密欄位一律顯示 [REDACTED]。
 func (c Config) Redacted() string {
 	return fmt.Sprintf("組態摘要：listen=%s data_dir=%s timezone=%s db=%s busy_timeout_ms=%d media=%s documents=%s attachments=%s backups=%s logs_dir=%s logs_level=%s session_ttl_hours=%d root_password_hash=%s http_timeouts_ms=[read_header=%d read=%d write=%d idle=%d request=%d shutdown=%d] max_body_bytes=%d security_headers=[frame_options=%s csp=%s referrer_policy=%s permissions_policy=%s] tx=[begin_mode=%s nested=%s busy_retry_max=%d busy_retry_backoff_ms=%d timeout_ms=%d schema_guard=%s]",

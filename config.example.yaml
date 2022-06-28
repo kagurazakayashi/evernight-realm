@@ -58,3 +58,16 @@ security:
     frame_options: ""                 # 空 = DENY
     referrer_policy: ""               # 空 = no-referrer
     permissions_policy: ""            # 空 = camera=(self), microphone=(), geolocation=()
+
+  # 跨来源（CORS）策略。预设完全关闭：不放行任何来源时，服务端不下发任何跨域标头，
+  # 浏览器只能同源存取本服务（正式部署即应保持这样的状态）。
+  # 开发期要让浏览器直接调用 Go，才把「页面的来源」写进来；也可用环境变量临时给定：
+  #   ER_SECURITY_CORS_ALLOWED_ORIGINS=http://127.0.0.1:8765
+  # 启动摘要会打印 cors=[...]，开启时还会多一行「跨域提示」，避免忘了改回来。
+  cors:
+    allowed_origins: []               # 空 = 关闭；每项须为 scheme://host[:port] 精确来源，或 "*"
+    allowed_methods: [GET, HEAD, OPTIONS]
+    allowed_headers: [Accept, Accept-Language, Content-Type, Idempotency-Key, X-Request-Id]
+    exposed_headers: [X-Request-Id]   # 允许客户端脚本读回的响应标头
+    allow_credentials: false          # 与 "*" 同时使用会被拒绝启动（浏览器本就拒绝此组合）
+    max_age_seconds: 600              # 预检结果缓存；0 = 不缓存

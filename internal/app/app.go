@@ -261,6 +261,9 @@ func run(ctx context.Context, releaseSignals func(), args []string, out io.Write
 	if cfg.ListenAllInterfaces() {
 		fmt.Fprintln(out, "風險提示：監聽地址暴露於所有介面（含公網網卡），請確認防火牆與部署範圍。")
 	}
+	if note := cfg.CORSNotice(); note != "" {
+		fmt.Fprintf(out, "跨域提示：%s\n", note)
+	}
 	fmt.Fprintf(out, "HTTP 服務已啟動：http://%s （/health 存活、/ready 就緒、/time 伺服器時間）\n", ln.Addr())
 
 	serveErr := make(chan error, 1)

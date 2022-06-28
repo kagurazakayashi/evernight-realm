@@ -40,6 +40,8 @@ type Server struct {
 	httpSrv *http.Server
 	// secHeaders 為啟動時算好的安全回應頭（組態留空時為內建基線）。
 	secHeaders securityHeaderSet
+	// cors 為啟動時算好的跨域策略（組態未列來源時完全關閉）。
+	cors corsPolicy
 	// newID 為伺服器側標識的產生器，固定為 idgen.New（全服務唯一產生點）；
 	// 以欄位持有是為了讓測試能注入失敗情境，驗證該路徑不降級而是拒絕請求。
 	newID func() (idgen.ID, error)
@@ -62,6 +64,7 @@ func New(cfg *config.Config, version string, deps Deps) *Server {
 		version:     version,
 		logger:      log.New(os.Stderr, "evernight-server ", log.LstdFlags),
 		secHeaders:  buildSecurityHeaders(cfg),
+		cors:        buildCORSPolicy(cfg),
 		newID:       idgen.New,
 		ready:       deps.Ready,
 		clock:       clock,
@@ -93,12 +96,15 @@ func (s *Server) Handler() http.Handler {
 }
 
 // wrap 為路由樹套上完整中介層鏈（測試亦以本方法組裝，確保與正式路徑一致）。
-// 中介層由外而內為：安全回應頭 → 請求關聯 ID → panic 恢復 → 處理期限 → 請求體上限 → 路由。
+// 中介層由外而內為：安全回應頭 → 請求關聯 ID → 跨域標頭 → panic 恢復 → 處理期限 → 請求體上限 → 路由。
+//
+// 跨域放在關聯 ID 之後、panic 恢復之前：預檢與被拒的來源也要能對應到日誌裡的
+// request_id；而它必須在請求體上限之外——OPTIONS 預檢沒有本體，不該被本體規則波及。
 //
 // 安全回應頭固定最外層，讓鏈上任何一層自行寫出的回應（含無法產生關聯 ID 時的拒絕）
 // 都帶著標頭，不外洩未受保護的回應。
 func (s *Server) wrap(h http.Handler) http.Handler {
-	return chain(h, s.withSecurityHeaders, s.withRequestID, s.withRecovery, s.withTimeout, s.withBodyLimit)
+	return chain(h, s.withSecurityHeaders, s.withRequestID, s.withCORS, s.withRecovery, s.withTimeout, s.withBodyLimit)
 }
 
 // registerRoutes 集中登記路由；未登記的路徑與不支援的方法都回傳統一錯誤信封。

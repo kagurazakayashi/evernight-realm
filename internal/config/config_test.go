@@ -650,3 +650,153 @@ func TestLoadCommandLineOverridesYAML(t *testing.T) {
 		t.Errorf("命令列 --data-dir 應優先於 yaml: %q", cfg.Server.DataDir)
 	}
 }
+
+// --- 跨域（CORS）組態 ---
+
+func TestCORSDefaultsAreClosed(t *testing.T) {
+	cfg, err := Load(Options{ConfigPath: filepath.Join(t.TempDir(), "nope.yaml")})
+	if err != nil {
+		t.Fatalf("Load 失敗: %v", err)
+	}
+	if len(cfg.Security.CORS.AllowedOrigins) != 0 {
+		t.Errorf("跨域預設必須完全關閉，實際 %v", cfg.Security.CORS.AllowedOrigins)
+	}
+	if cfg.Security.CORS.MaxAgeSeconds != 600 {
+		t.Errorf("預設 max_age_seconds 應為 600，實際 %d", cfg.Security.CORS.MaxAgeSeconds)
+	}
+	// 方法與標頭清單即使沒開啟也預先備好：日後只放來源一項就能用。
+	if !contains(cfg.Security.CORS.AllowedMethods, "OPTIONS") {
+		t.Errorf("預設方法清單應含 OPTIONS，實際 %v", cfg.Security.CORS.AllowedMethods)
+	}
+	if !contains(cfg.Security.CORS.AllowedHeaders, "Idempotency-Key") {
+		t.Errorf("預設標頭清單應含 Idempotency-Key（後續寫請求需要），實際 %v", cfg.Security.CORS.AllowedHeaders)
+	}
+	if !contains(cfg.Security.CORS.ExposedHeaders, "X-Request-Id") {
+		t.Errorf("預設暴露清單應含 X-Request-Id，實際 %v", cfg.Security.CORS.ExposedHeaders)
+	}
+	if cfg.CORSNotice() != "" {
+		t.Errorf("未開啟時不應有跨域提示，實際 %q", cfg.CORSNotice())
+	}
+	if !strings.Contains(cfg.Redacted(), "cors=[關閉]") {
+		t.Errorf("啟動摘要應標示跨域關閉，實際 %s", cfg.Redacted())
+	}
+}
+
+func TestCORSFromYAMLOriginIsNormalized(t *testing.T) {
+	p := writeConfig(t, "security:\n  cors:\n    allowed_origins:\n      - HTTP://Page.Example:8765/\n    allow_credentials: true\n    max_age_seconds: 30\n")
+	cfg, err := Load(Options{ConfigPath: p})
+	if err != nil {
+		t.Fatalf("Load 失敗: %v", err)
+	}
+	if got := cfg.Security.CORS.AllowedOrigins; len(got) != 1 || got[0] != "http://page.example:8765" {
+		t.Errorf("來源應正規化為小寫並去掉尾端斜線，實際 %v", got)
+	}
+	if !cfg.Security.CORS.AllowCredentials || cfg.Security.CORS.MaxAgeSeconds != 30 {
+		t.Errorf("憑據與快取時間未如載入: %+v", cfg.Security.CORS)
+	}
+	notice := cfg.CORSNotice()
+	if !strings.Contains(notice, "http://page.example:8765") {
+		t.Errorf("啟動提示必須列出被放寬的來源，實際 %q", notice)
+	}
+	if !strings.Contains(cfg.Redacted(), "cors=[origins=http://page.example:8765") {
+		t.Errorf("摘要應含跨域狀態，實際 %s", cfg.Redacted())
+	}
+}
+
+func TestCORSAllowedOriginsFromEnv(t *testing.T) {
+	t.Setenv("ER_SECURITY_CORS_ALLOWED_ORIGINS", " http://127.0.0.1:8765 , http://localhost:8766 ,,")
+	cfg, err := Load(Options{ConfigPath: filepath.Join(t.TempDir(), "nope.yaml")})
+	if err != nil {
+		t.Fatalf("Load 失敗: %v", err)
+	}
+	want := []string{"http://127.0.0.1:8765", "http://localhost:8766"}
+	got := cfg.Security.CORS.AllowedOrigins
+	if len(got) != len(want) || got[0] != want[0] || got[1] != want[1] {
+		t.Errorf("環境變數應解析為精確來源清單（去空白、跳過空項），實際 %v", got)
+	}
+}
+
+func TestValidateCORSRejections(t *testing.T) {
+	cases := []struct {
+		name   string
+		mutate func(*Config)
+		want   string
+	}{
+		{"來源帶路徑", func(c *Config) {
+			c.Security.CORS.AllowedOrigins = []string{"http://127.0.0.1:5206/admin"}
+		}, "不得帶路徑"},
+		{"來源帶查詢", func(c *Config) {
+			c.Security.CORS.AllowedOrigins = []string{"http://127.0.0.1:5206?a=1"}
+		}, "不得帶查詢"},
+		{"來源帶認證資訊", func(c *Config) {
+			c.Security.CORS.AllowedOrigins = []string{"http://root:pw@127.0.0.1"}
+		}, "不得帶"},
+		{"來源不是絕對位址", func(c *Config) {
+			c.Security.CORS.AllowedOrigins = []string{"127.0.0.1:5206"}
+		}, "scheme://host"},
+		{"萬用子網域", func(c *Config) {
+			c.Security.CORS.AllowedOrigins = []string{"http://*.example"}
+		}, "不支援萬用子網域"},
+		{"來源含換行（回應分割注入）", func(c *Config) {
+			c.Security.CORS.AllowedOrigins = []string{"http://127.0.0.1\r\nX-Forged: 1"}
+		}, "控制字元"},
+		{"萬用來源加憑據", func(c *Config) {
+			c.Security.CORS.AllowedOrigins = []string{"*"}
+			c.Security.CORS.AllowCredentials = true
+		}, "allow_credentials"},
+		{"方法名含非法字元", func(c *Config) {
+			c.Security.CORS.AllowedOrigins = []string{"http://127.0.0.1:5206"}
+			c.Security.CORS.AllowedMethods = []string{"GET POST"}
+		}, "非法方法名"},
+		{"標頭名含分隔字元", func(c *Config) {
+			c.Security.CORS.AllowedOrigins = []string{"http://127.0.0.1:5206"}
+			c.Security.CORS.AllowedHeaders = []string{"X-A;B"}
+		}, "非法標頭名"},
+		{"快取時間過大", func(c *Config) {
+			c.Security.CORS.AllowedOrigins = []string{"http://127.0.0.1:5206"}
+			c.Security.CORS.MaxAgeSeconds = 999999
+		}, "max_age_seconds"},
+		{"快取時間為負", func(c *Config) {
+			c.Security.CORS.AllowedOrigins = []string{"http://127.0.0.1:5206"}
+			c.Security.CORS.MaxAgeSeconds = -1
+		}, "max_age_seconds"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := Default()
+			tc.mutate(&cfg)
+			err := cfg.Validate()
+			if err == nil {
+				t.Fatalf("%s 應被拒絕", tc.name)
+			}
+			if !strings.Contains(err.Error(), tc.want) {
+				t.Errorf("錯誤訊息應含 %q，實際 %q", tc.want, err.Error())
+			}
+			if !strings.HasPrefix(err.Error(), "config:") {
+				t.Errorf("組態錯誤應統一帶 config: 前綴，實際 %q", err.Error())
+			}
+		})
+	}
+}
+
+func TestValidateCORSSingleWildcardIsAllowed(t *testing.T) {
+	// `*` 是明確選擇而非誤寫，因此允许，但不得與憑據同用（已由上一組測試把關）。
+	cfg := Default()
+	cfg.Security.CORS.AllowedOrigins = []string{"*"}
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("單獨使用 * 應可通過: %v", err)
+	}
+	if notice := cfg.CORSNotice(); !strings.Contains(notice, "全面開放") {
+		t.Errorf("* 必須在啟動提示裡被點名，實際 %q", notice)
+	}
+}
+
+// contains 回傳清單是否含指定值（測試用的小工具）。
+func contains(list []string, want string) bool {
+	for _, v := range list {
+		if v == want {
+			return true
+		}
+	}
+	return false
+}

@@ -12,6 +12,7 @@ import (
 	"flag"
 	"fmt"
 	"net"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -118,6 +119,34 @@ type SecurityConfig struct {
 	RootPasswordHash string `yaml:"root_password_hash"`
 	// Headers 為 HTTP 安全回應頭（STEP-035）。
 	Headers SecurityHeadersConfig `yaml:"headers"`
+	// CORS 為跨來源存取策略（STEP-055）；預設不開放任何來源。
+	CORS CORSConfig `yaml:"cors"`
+}
+
+// CORSConfig 為跨來源（CORS）策略組態。
+//
+// 預設值是「完全關閉」：AllowedOrigins 空 ⇒ 服務端不下發任何跨域標頭，
+// 行為與本步之前逐字相同。開發期要讓瀏覽器直接呼叫 Go，必須在組態裡
+// 明確寫入來源；這道「預設不寬鬆」的門就是「開發設定不會無條件進入正式組態」
+// 的實作——正式組態裡沒有這一段，就沒有跨域出口。
+//
+// 校驗刻意嚴格：來源只收 `*` 或 `scheme://host[:port]` 的精確寫法（不接受路徑、
+// 不接受萬用子網域），標頭與方法名稱必须是 HTTP token。原因有兩個：回應值會
+// 直接反射到標頭裡，任何可注入字元（CR/LF）都會變成回應分割；而 `*.example`
+// 這類半萬用寫法的實際放行範圍常被部署者誤解。
+type CORSConfig struct {
+	// AllowedOrigins 為放行來源清單；空清單代表關閉，`*` 代表任意來源。
+	AllowedOrigins []string `yaml:"allowed_origins"`
+	// AllowedMethods 為預檢可放行的請求方法（一律轉大寫比對）。
+	AllowedMethods []string `yaml:"allowed_methods"`
+	// AllowedHeaders 為預檢可放行的請求標頭（客戶端自訂標頭需列在此處）。
+	AllowedHeaders []string `yaml:"allowed_headers"`
+	// ExposedHeaders 為允許客戶端腳本讀回的回應標頭。
+	ExposedHeaders []string `yaml:"exposed_headers"`
+	// AllowCredentials 允許附帶憑據（Cookie / 授權標頭）；與 `*` 同時使用一律拒絕。
+	AllowCredentials bool `yaml:"allow_credentials"`
+	// MaxAgeSeconds 為預檢結果快取時間；0 表示不允許快取。
+	MaxAgeSeconds int `yaml:"max_age_seconds"`
 }
 
 // SecurityHeadersConfig 為 HTTP 安全回應頭組態。
@@ -173,6 +202,13 @@ func Default() Config {
 		},
 		Security: SecurityConfig{
 			SessionTTLHours: 24,
+			CORS: CORSConfig{
+				// 來源清單刻意留空：跨域預設關閉，需要時由部署者明確開啟。
+				AllowedMethods: []string{"GET", "HEAD", "OPTIONS"},
+				AllowedHeaders: []string{"Accept", "Accept-Language", "Content-Type", "Idempotency-Key", "X-Request-Id"},
+				ExposedHeaders: []string{"X-Request-Id"},
+				MaxAgeSeconds:  600,
+			},
 		},
 	}
 }
@@ -387,7 +423,157 @@ func (c *Config) Validate() error {
 			return errors.New("config: security.headers.content_security_policy 不得包含 'unsafe-eval'（專案安全基線）")
 		}
 	}
+
+	return c.Security.CORS.Validate()
+}
+
+// 預檢快取時間上限：一天。超過這個值通常意味著把開發期設定留進了正式組態。
+const maxCORSMaxAge = 86400
+
+// Validate 正規化並校驗跨域組態；空來源清單代表關閉，直接通過。
+//
+// 正規化包含：來源轉小寫並去掉尾端 `/`、方法轉大寫、標頭名稱去空白。
+// 拒絕項目：含 CR/LF 或其他控制字元的值（會進入回應標頭）、非 token 形狀的
+// 方法與標頭名、帶路徑/查詢/萬用子網域的來源、`*` 與 allow_credentials 並存。
+func (c *CORSConfig) Validate() error {
+	if len(c.AllowedOrigins) == 0 {
+		// 關閉狀態下其餘欄位仍要正規化，避免日後開啟時帶著髒值。
+		c.normalizeLists()
+		return nil
+	}
+
+	origins := make([]string, 0, len(c.AllowedOrigins))
+	wildcard := false
+	for _, raw := range c.AllowedOrigins {
+		origin := strings.ToLower(strings.TrimSpace(raw))
+		// 尾端斜線一律去掉：瀏覽器送出的 Origin 永不含路徑，留著 `http://host/`
+		// 這種寫法會讓人以為設好了、實際永遠比對不上。
+		origin = strings.TrimSuffix(origin, "/")
+		if origin == "" {
+			continue
+		}
+		if err := validateCORSHeaderValue("security.cors.allowed_origins", origin); err != nil {
+			return err
+		}
+		if origin == "*" {
+			wildcard = true
+			origins = append(origins, "*")
+			continue
+		}
+		if err := validateCORSOrigin(origin); err != nil {
+			return err
+		}
+		origins = append(origins, origin)
+	}
+	c.AllowedOrigins = origins
+
+	if c.AllowCredentials && wildcard {
+		return errors.New("config: security.cors.allow_credentials 不得與 allowed_origins 的 \"*\" 同時使用" +
+			"（瀏覽器一律拒絕此組合，等於沒有放行）")
+	}
+	if c.MaxAgeSeconds < 0 || c.MaxAgeSeconds > maxCORSMaxAge {
+		return fmt.Errorf("config: security.cors.max_age_seconds 需為 0..%d，實際為 %d", maxCORSMaxAge, c.MaxAgeSeconds)
+	}
+	return c.normalizeLists()
+}
+
+// normalizeLists 正規化方法與標頭清單並逐項校驗形状。
+func (c *CORSConfig) normalizeLists() error {
+	methods := make([]string, 0, len(c.AllowedMethods))
+	for _, raw := range c.AllowedMethods {
+		method := strings.ToUpper(strings.TrimSpace(raw))
+		if method == "" {
+			continue
+		}
+		if !isHTTPToken(method) {
+			return fmt.Errorf("config: security.cors.allowed_methods 含非法方法名 %q", raw)
+		}
+		methods = append(methods, method)
+	}
+	c.AllowedMethods = methods
+
+	for _, entry := range []struct {
+		name string
+		src  []string
+		dst  *[]string
+	}{
+		{"allowed_headers", c.AllowedHeaders, &c.AllowedHeaders},
+		{"exposed_headers", c.ExposedHeaders, &c.ExposedHeaders},
+	} {
+		out := make([]string, 0, len(entry.src))
+		for _, raw := range entry.src {
+			token := strings.TrimSpace(raw)
+			if token == "" {
+				continue
+			}
+			if err := validateCORSHeaderValue("security.cors."+entry.name, token); err != nil {
+				return err
+			}
+			if !isHTTPToken(token) {
+				return fmt.Errorf("config: security.cors.%s 含非法標頭名 %q", entry.name, raw)
+			}
+			out = append(out, token)
+		}
+		*entry.dst = out
+	}
 	return nil
+}
+
+// validateCORSOrigin 檢查精確來源的形狀：scheme://host[:port]，不得帶路徑、
+// 查詢、片段、認證資訊或萬用子網域。
+func validateCORSOrigin(origin string) error {
+	parsed, err := url.Parse(origin)
+	if err != nil || parsed.Scheme == "" || parsed.Host == "" {
+		return fmt.Errorf("config: security.cors.allowed_origins 需為 * 或 scheme://host[:port] 精確來源，實際為 %q", origin)
+	}
+	if parsed.Path != "" && parsed.Path != "/" {
+		return fmt.Errorf("config: security.cors.allowed_origins 不得帶路徑，實際為 %q", origin)
+	}
+	if parsed.RawQuery != "" || parsed.Fragment != "" || parsed.User != nil {
+		return fmt.Errorf("config: security.cors.allowed_origins 不得帶查詢、片段或憑據，實際為 %q", origin)
+	}
+	if strings.HasPrefix(parsed.Hostname(), "*") {
+		return fmt.Errorf("config: security.cors.allowed_origins 不支援萬用子網域（放行範圍易被誤解），實際為 %q", origin)
+	}
+	return nil
+}
+
+// validateCORSHeaderValue 擋下會破壞 HTTP 標頭的值：控制字元（含 CR/LF）一律拒絕。
+func validateCORSHeaderValue(field, value string) error {
+	for _, r := range value {
+		if r <= 0x20 || r == 0x7F {
+			return fmt.Errorf("config: %s 含空白或控制字元，無法用於回應標頭：%q", field, value)
+		}
+	}
+	return nil
+}
+
+// isHTTPToken 依 RFC 7230 判定 token：只允許 ASCII 可見字元，且不得為 separator。
+//
+// 方法名與標頭名都會被反射進回應標頭，任何放寬都等於給注入留口子。
+func isHTTPToken(value string) bool {
+	if value == "" {
+		return false
+	}
+	for i := 0; i < len(value); i++ {
+		c := value[i]
+		if c <= 0x20 || c >= 0x7F || isHTTPSeparator(c) {
+			return false
+		}
+	}
+	return true
+}
+
+// isHTTPSeparator 為 RFC 7230 的 separator 集合（含水平定位字元與空格）。
+//
+// 逐字元列出而非塞進字串常數：這個集合本身含反斜線與雙引號，
+// 写成字串常數會需要一層容易看錯的跳脫。
+func isHTTPSeparator(c byte) bool {
+	switch c {
+	case '(', ')', '<', '>', '@', ',', ';', ':', '\\', '"', '/', '[', ']', '?', '=', '{', '}', 0x09, ' ':
+		return true
+	}
+	return false
 }
 
 // 請求體上限的合理區間：過小會使正常 JSON 請求失效，過大則失去保護意義。
@@ -420,7 +606,7 @@ func (c Config) DisplayLocation() *time.Location {
 
 // Redacted 回傳組態的脫敏摘要（供啟動日誌），機密欄位一律顯示 [REDACTED]。
 func (c Config) Redacted() string {
-	return fmt.Sprintf("組態摘要：listen=%s data_dir=%s timezone=%s db=%s busy_timeout_ms=%d media=%s documents=%s attachments=%s backups=%s logs_dir=%s logs_level=%s session_ttl_hours=%d root_password_hash=%s http_timeouts_ms=[read_header=%d read=%d write=%d idle=%d request=%d shutdown=%d] max_body_bytes=%d security_headers=[frame_options=%s csp=%s referrer_policy=%s permissions_policy=%s] tx=[begin_mode=%s nested=%s busy_retry_max=%d busy_retry_backoff_ms=%d timeout_ms=%d schema_guard=%s]",
+	return fmt.Sprintf("組態摘要：listen=%s data_dir=%s timezone=%s db=%s busy_timeout_ms=%d media=%s documents=%s attachments=%s backups=%s logs_dir=%s logs_level=%s session_ttl_hours=%d root_password_hash=%s http_timeouts_ms=[read_header=%d read=%d write=%d idle=%d request=%d shutdown=%d] max_body_bytes=%d security_headers=[frame_options=%s csp=%s referrer_policy=%s permissions_policy=%s] cors=[%s] tx=[begin_mode=%s nested=%s busy_retry_max=%d busy_retry_backoff_ms=%d timeout_ms=%d schema_guard=%s]",
 		c.Server.Listen, c.Server.DataDir, c.Server.DisplayTimezone,
 		c.Database.Path, c.Database.BusyTimeoutMS,
 		c.Media, c.Documents, c.Attachments, c.Backups,
@@ -432,9 +618,47 @@ func (c Config) Redacted() string {
 		presence(c.Security.Headers.ContentSecurityPolicy),
 		presence(c.Security.Headers.ReferrerPolicy),
 		presence(c.Security.Headers.PermissionsPolicy),
+		c.Security.CORS.summary(),
 		c.Database.Transaction.BeginMode, c.Database.Transaction.Nested,
 		c.Database.Transaction.BusyRetryMax, c.Database.Transaction.BusyRetryBackoffMS,
 		c.Database.Transaction.TimeoutMS, c.Database.SchemaGuard)
+}
+
+// CORSNotice 回傳啟動時該說的一句跨域提示；未開啟時回傳空字串。
+//
+// 開啟狀態必須在啟動輸出裡看得見：這組設定通常是為了開發期聯調才改的，
+// 改完忘了改回來的成本（內網任何頁面都能讀端點）遠高於多印一行字。
+func (c Config) CORSNotice() string {
+	cors := c.Security.CORS
+	if len(cors.AllowedOrigins) == 0 {
+		return ""
+	}
+	if cors.wildcard() {
+		return "跨域已全面開放（allowed_origins=\"*\"）：內網任何頁面都能讀取本服務端點。" +
+			"此設定只應用於開發期聯調，正式部署請改回精確來源或留空。"
+	}
+	return fmt.Sprintf("跨域已放寬：%d 個來源（%s）；此設定多為開發期聯調所用，正式部署請確認是否需要保留。",
+		len(cors.AllowedOrigins), strings.Join(cors.AllowedOrigins, ", "))
+}
+
+// wildcard 表示來源清單含 `*`。
+func (c CORSConfig) wildcard() bool {
+	for _, origin := range c.AllowedOrigins {
+		if origin == "*" {
+			return true
+		}
+	}
+	return false
+}
+
+// summary 產生跨域策略的一行摘要；開啟時把放行來源原樣列出，
+// 因為「哪幾個來源被放寬」是部署狀態，不是憑據，藏在日誌裡只會讓人以為沒開。
+func (c CORSConfig) summary() string {
+	if len(c.AllowedOrigins) == 0 {
+		return "關閉"
+	}
+	return fmt.Sprintf("origins=%s credentials=%t max_age=%d",
+		strings.Join(c.AllowedOrigins, "|"), c.AllowCredentials, c.MaxAgeSeconds)
 }
 
 // presence 將安全回應頭的覆寫值表示為「自訂」或「(預設)」，避免摘要輸出整段策略。
@@ -491,6 +715,18 @@ func applyEnv(cfg *Config) error {
 		if v := os.Getenv(f.env); v != "" {
 			*f.dst = v
 		}
+	}
+
+	// 跨域來源以逗號分隔清單由環境變數給定：開發期不改組態檔就能放行本機來源，
+	// 也正因如此，它不會被寫進正式部署的 config.yaml（該檔由範例模板生成）。
+	if v := os.Getenv("ER_SECURITY_CORS_ALLOWED_ORIGINS"); v != "" {
+		origins := []string{}
+		for _, part := range strings.Split(v, ",") {
+			if trimmed := strings.TrimSpace(part); trimmed != "" {
+				origins = append(origins, trimmed)
+			}
+		}
+		cfg.Security.CORS.AllowedOrigins = origins
 	}
 
 	type intField struct {
@@ -571,6 +807,18 @@ security:
     frame_options: ""                 # 空 = DENY
     referrer_policy: ""               # 空 = no-referrer
     permissions_policy: ""            # 空 = camera=(self), microphone=(), geolocation=()
+
+  # 跨來源（CORS）策略（STEP-055）。預設完全關閉：不放行任何來源時，
+  # 服務端不下發任何跨域標頭，瀏覽器端只能同源存取。
+  # 開發期要讓瀏覽器直接呼叫本服務，才把頁面來源寫進來（或設環境變數
+  # ER_SECURITY_CORS_ALLOWED_ORIGINS=http://127.0.0.1:8765）；正式部署留空。
+  cors:
+    allowed_origins: []               # 空 = 關閉；可寫 "*"... 但等於對內網所有頁面開放
+    allowed_methods: [GET, HEAD, OPTIONS]
+    allowed_headers: [Accept, Accept-Language, Content-Type, Idempotency-Key, X-Request-Id]
+    exposed_headers: [X-Request-Id]   # 允許客戶端腳本讀回的回應標頭
+    allow_credentials: false          # 與 "*" 同時使用會被拒絕啟動
+    max_age_seconds: 600              # 預檢結果快取；0 = 不快取
 `
 
 // Resolve 將所有相對路徑欄位解析為資料目錄下的絕對路徑並清除冗餘片段。

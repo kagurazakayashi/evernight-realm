@@ -1,14 +1,13 @@
 package main
 
 import (
-	"context"
 	"errors"
 	"os"
 	"path/filepath"
-	"runtime"
 	"strings"
 	"testing"
 
+	"github.com/kagurazakayashi/evernight-realm/internal/devkit"
 	"github.com/kagurazakayashi/evernight-realm/internal/webassets/bundle"
 )
 
@@ -61,156 +60,16 @@ func TestBuildArgs(t *testing.T) {
 	})
 }
 
-func TestQualityCommandsShape(t *testing.T) {
-	gates, err := qualityCommands(`D:\SDK\flutter\bin\flutter.bat`)
-	if err != nil {
-		t.Fatalf("組裝品質閘失敗: %v", err)
+func TestBuildCommandUsesFrontendToolchain(t *testing.T) {
+	app := devkit.Frontend{Dir: `D:\repo\evernight-realm-app`, FlutterExe: `D:\SDK\flutter\bin\flutter.bat`}
+	cmd := buildCommand(app, `D:\repo\internal\webassets\dist`, options{})
+
+	if cmd.Exe != app.FlutterExe {
+		t.Errorf("應使用解析出的 flutter，得到 %q", cmd.Exe)
 	}
-	if len(gates) != 3 {
-		t.Fatalf("應為三道品質閘，得到 %d", len(gates))
+	if strings.Contains(cmd.Desc, "--") {
+		t.Errorf("desc 不應出現引數: %q", cmd.Desc)
 	}
-
-	const dartExe = `D:\SDK\flutter\bin\dart.bat`
-	if gates[0].exe != dartExe {
-		t.Errorf("第一道應使用同目錄 dart，得到 %q", gates[0].exe)
-	}
-	if got := strings.Join(gates[0].args, " "); !strings.Contains(got, "--set-exit-if-changed") {
-		t.Errorf("格式閘未設定差異即失敗: %s", got)
-	}
-	for _, gate := range gates[1:] {
-		if gate.exe != `D:\SDK\flutter\bin\flutter.bat` {
-			t.Errorf("%s 應使用 flutter 本身，得到 %q", gate.desc, gate.exe)
-		}
-	}
-
-	t.Run("說明文字不複寫引數值", func(t *testing.T) {
-		for _, gate := range gates {
-			if strings.Contains(gate.desc, "--") {
-				t.Errorf("desc 不應出現引數: %q", gate.desc)
-			}
-		}
-	})
-}
-
-func TestDartAlongside(t *testing.T) {
-	cases := []struct {
-		name  string
-		input string
-		want  string
-	}{
-		{name: "Windows 批次檔", input: `D:\SDK\flutter\bin\flutter.bat`, want: `D:\SDK\flutter\bin\dart.bat`},
-		{name: "Windows 執行檔", input: `C:\f\futter\flutter.exe`, want: `C:\f\futter\dart.exe`},
-		{name: "Unix 無副檔名", input: "/opt/flutter/bin/flutter", want: "/opt/flutter/bin/dart"},
-		{name: "大寫開頭", input: `D:\f\Flutter.bat`, want: `D:\f\Dart.bat`},
-		{name: "檔名不是 flutter 開頭時不猜", input: "/opt/fui", want: ""},
-		{name: "只有檔名", input: "flutter", want: "dart"},
-	}
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			if got := dartAlongside(tc.input); got != tc.want {
-				t.Errorf("dartAlongside(%q) = %q，預期 %q", tc.input, got, tc.want)
-			}
-		})
-	}
-}
-
-func TestDartExecutable(t *testing.T) {
-	dir := t.TempDir()
-
-	t.Run("同目錄的 dart 優先", func(t *testing.T) {
-		writeFile(t, dir, "dart.bat", "@echo off\n")
-		writeFile(t, dir, "flutter.bat", "@echo off\n")
-		got, err := dartExecutable(filepath.Join(dir, "flutter.bat"))
-		if err != nil {
-			t.Fatalf("不應失敗: %v", err)
-		}
-		if filepath.Clean(got) != filepath.Clean(filepath.Join(dir, "dart.bat")) {
-			t.Errorf("得到 %q", got)
-		}
-	})
-
-	t.Run("同目錄推不出來時退回 PATH", func(t *testing.T) {
-		stubLookPath(t, func(name string) (string, error) {
-			if name != "dart" {
-				return "", errors.New("只應查 dart")
-			}
-			return `/other/sdk/dart`, nil
-		})
-		got, err := dartExecutable("/nowhere/FlutterTool")
-		if err != nil {
-			t.Fatalf("不應失敗: %v", err)
-		}
-		if got != "/other/sdk/dart" {
-			t.Errorf("得到 %q", got)
-		}
-	})
-
-	t.Run("都找不到時回傳錯誤並列出試過的路徑", func(t *testing.T) {
-		stubLookPath(t, func(string) (string, error) { return "", errors.New("查無") })
-		missing := filepath.Join(t.TempDir(), "flutter.bat")
-		_, err := dartExecutable(missing)
-		if err == nil {
-			t.Fatal("找不到 dart 時應回傳錯誤")
-		}
-		if !strings.Contains(err.Error(), "dart") {
-			t.Errorf("錯誤訊息應點出 dart: %v", err)
-		}
-	})
-}
-
-func TestFlutterCommandRun(t *testing.T) {
-	ctx := context.Background()
-
-	t.Run("命令不存在時錯誤可判讀", func(t *testing.T) {
-		cmd := flutterCommand{desc: "不存在的命令", exe: "buildweb-no-such-executable-xyz"}
-		err := cmd.run(ctx, t.TempDir(), os.Stdout, os.Stderr)
-		if err == nil {
-			t.Fatal("應回傳錯誤")
-		}
-		if !strings.Contains(err.Error(), "不存在的命令") {
-			t.Errorf("錯誤應含說明文字: %v", err)
-		}
-	})
-
-	t.Run("非零退出碼寫進錯誤訊息", func(t *testing.T) {
-		var cmd flutterCommand
-		if runtime.GOOS == "windows" {
-			shell := os.Getenv("ComSpec")
-			if shell == "" {
-				shell = "cmd.exe"
-			}
-			cmd = flutterCommand{desc: "回傳 3", exe: shell, args: []string{"/c", "exit", "3"}}
-		} else {
-			cmd = flutterCommand{desc: "回傳 3", exe: "/bin/sh", args: []string{"-c", "exit 3"}}
-		}
-		err := cmd.run(ctx, t.TempDir(), os.Stdout, os.Stderr)
-		if err == nil {
-			t.Fatal("非零退出碼應回傳錯誤")
-		}
-		if !strings.Contains(err.Error(), "退出碼 3") {
-			t.Errorf("錯誤應含退出碼: %v", err)
-		}
-	})
-
-	t.Run("成功時輸出轉接給呼叫方", func(t *testing.T) {
-		var stdout, stderr strings.Builder
-		var cmd flutterCommand
-		if runtime.GOOS == "windows" {
-			shell := os.Getenv("ComSpec")
-			if shell == "" {
-				shell = "cmd.exe"
-			}
-			cmd = flutterCommand{desc: "印一行", exe: shell, args: []string{"/c", "echo buildweb-probe"}}
-		} else {
-			cmd = flutterCommand{desc: "印一行", exe: "/bin/sh", args: []string{"-c", "echo buildweb-probe"}}
-		}
-		if err := cmd.run(context.Background(), t.TempDir(), &stdout, &stderr); err != nil {
-			t.Fatalf("不應失敗: %v", err)
-		}
-		if !strings.Contains(stdout.String(), "buildweb-probe") {
-			t.Errorf("輸出未轉接: %q", stdout.String())
-		}
-	})
 }
 
 func TestCleanOutput(t *testing.T) {
@@ -220,7 +79,7 @@ func TestCleanOutput(t *testing.T) {
 		if err := cleanOutput(out, &stdout); err != nil {
 			t.Fatalf("不應失敗: %v", err)
 		}
-		if !fileExists(filepath.Join(out, bundle.PlaceholderName)) {
+		if !devkit.FileExists(filepath.Join(out, bundle.PlaceholderName)) {
 			t.Error("空目錄會讓 go:embed 直接編譯失敗，必須留下佔位檔讓後端仍可建置")
 		}
 	})
@@ -263,7 +122,7 @@ func TestCleanOutput(t *testing.T) {
 		if err := cleanOutput(path, &strings.Builder{}); err == nil {
 			t.Fatal("產物路徑為檔案時應拒絕，避免拿刪除目錄的邏輯去動檔案")
 		}
-		if !fileExists(path) {
+		if !devkit.FileExists(path) {
 			t.Error("拒絕時不得順手刪掉該檔案")
 		}
 	})

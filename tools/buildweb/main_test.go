@@ -2,8 +2,11 @@ package main
 
 import (
 	"errors"
+	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/kagurazakayashi/evernight-realm/internal/devkit"
 )
 
 func TestParseOptionsDefaults(t *testing.T) {
@@ -84,15 +87,35 @@ func TestValidateDefinesAcceptsEmptyValue(t *testing.T) {
 
 func TestMakePlanReportsMissingSubmodule(t *testing.T) {
 	root := t.TempDir()
-	writeFile(t, root, gitmodulesFile, realGitmodules)
+	writeFile(t, root, devkit.GitmodulesFile, realGitmodules)
 
 	var stdout, stderr strings.Builder
 	_, err := makePlan(options{repoRoot: root, output: defaultOutputRel, stdout: &stdout, stderr: &stderr})
-	if !errors.Is(err, ErrSubmoduleMissing) {
+	if !errors.Is(err, devkit.ErrSubmoduleMissing) {
 		t.Fatalf("子模組未檢出時應回 ErrSubmoduleMissing，實際 %v", err)
 	}
 	if stdout.Len() != 0 {
 		t.Errorf("前置檢查失敗時不應已印出建置摘要: %q", stdout.String())
+	}
+}
+
+func TestFrontendCheckStopsWhenEntryMissing(t *testing.T) {
+	// 倉庫狀態完好但前端尚未有品質入口時，--check 必須在動任何檔案之前就停下來，
+	// 否則會留下「舊產物已刪、新產物沒建」的空目錄。這裡直接組目標，不依賴本機 PATH。
+	root, appDir := fakeRepo(t)
+	target := buildTarget{
+		root: root,
+		app:  devkit.Frontend{Module: "evernight-realm-app", Dir: appDir, FlutterExe: "flutter"},
+		out:  filepath.Join(root, filepath.FromSlash(defaultOutputRel)),
+	}
+
+	var stdout, stderr strings.Builder
+	err := runFrontendCheck(t.Context(), target.app, options{stdout: &stdout, stderr: &stderr})
+	if !errors.Is(err, devkit.ErrSubmoduleMissing) {
+		t.Fatalf("入口缺失應回 ErrSubmoduleMissing，實際 %v", err)
+	}
+	if stdout.Len() != 0 {
+		t.Errorf("入口缺失時不應已印出品質閘進度: %q", stdout.String())
 	}
 }
 

@@ -39,13 +39,14 @@ func verifyArtifacts(out string) (artifactReport, error) {
 //
 // 缺失與否決的理由要分開寫：缺少必要檔案代表「建置沒跑完或被打斷」，
 // 未採用本機 CanvasKit 代表「產物會是離線白屏的那一份」，兩者下一步動作不同。
+// 工具名前綴由 main 統一加，這裡只描述事實。
 func describeVerifyFailure(out string, err error) error {
 	var missing *bundle.MissingFileError
 	switch {
 	case errors.As(err, &missing):
-		return fmt.Errorf("buildweb: 產物不完整，缺少 %s（於 %s）", missing.Path, out)
+		return fmt.Errorf("產物不完整，缺少 %s（於 %s）", missing.Path, out)
 	default:
-		return fmt.Errorf("buildweb: %w（於 %s）", err, out)
+		return fmt.Errorf("%w（於 %s）", err, out)
 	}
 }
 

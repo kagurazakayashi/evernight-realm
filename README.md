@@ -18,7 +18,7 @@ Evernight Realm is a self-hosted, offline-first platform for a small group of pl
 
 ## Current status
 
-Evernight Realm is under active development. No stable release is available yet; the repository currently contains the project skeleton.
+Evernight Realm is under active development and no stable release is available yet. The server can already be built as a **single executable**: one port serves both the web interface (so far the app shell — switchable UI language and a server connectivity probe, with business features still in development) and the API endpoints, so a browser pointed at that address is all you need — no separate static hosting.
 
 ## How it will work (once released)
 

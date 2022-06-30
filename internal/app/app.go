@@ -19,6 +19,7 @@ import (
 	"github.com/kagurazakayashi/evernight-realm/internal/database/migrate"
 	"github.com/kagurazakayashi/evernight-realm/internal/httpapi"
 	"github.com/kagurazakayashi/evernight-realm/internal/timeutil"
+	"github.com/kagurazakayashi/evernight-realm/internal/webassets"
 )
 
 // Version 為目前開發版本。正式版號策略待發布流程定案後統一管理。
@@ -126,6 +127,18 @@ func migrationSummary(res migrate.Result) string {
 	}
 	return fmt.Sprintf("資料庫遷移：已套用 %d 項（version %d → %d：%s）",
 		len(res.Applied), res.FromVersion, res.ToVersion, strings.Join(names, "、"))
+}
+
+// endpointsNote 產生啟動行括號裡的端點清單。
+//
+// 只在內嵌產物可用時列舉「/ 網頁介面」：摘要寫了那個位址卻回 404，比不寫更糟——
+// 人會先去試它，然後才發現執行檔裡根本沒有前端。
+func endpointsNote(status webassets.Status) string {
+	const apiNote = "/health 存活、/ready 就緒、/time 伺服器時間"
+	if status.Available {
+		return "/ 網頁介面、" + apiNote
+	}
+	return apiNote
 }
 
 // prepare 依命令列參數載入組態、規範化路徑、建立資料目錄並開啟資料庫。
@@ -241,7 +254,10 @@ func run(ctx context.Context, releaseSignals func(), args []string, out io.Write
 	// 先建立監聽器再輸出啟動資訊：連接埠被佔用等失敗直接回報，
 	// 且輸出的是實際監聽地址（監聽埠設為 0 時可見系統指派的埠號）。
 	// 就緒與否以資料庫能否回應為準；業務時間一律取自伺服器時鐘。
-	srv := httpapi.New(&cfg, Version, httpapi.Deps{Ready: db.Ping, Clock: timeutil.System()})
+	// 內嵌的 Web 產物只在判定可用時掛上路徑，不可用時啟動摘要如實寫出缺什麼
+	// （判定由 internal/webassets 完成，傳輸層只收到一份檔案系統或 nil）。
+	webFS, webStatus := webassets.Dist()
+	srv := httpapi.New(&cfg, Version, httpapi.Deps{Ready: db.Ping, Clock: timeutil.System(), Web: webFS})
 	ln, err := srv.Listen()
 	if err != nil {
 		return err
@@ -264,7 +280,8 @@ func run(ctx context.Context, releaseSignals func(), args []string, out io.Write
 	if note := cfg.CORSNotice(); note != "" {
 		fmt.Fprintf(out, "跨域提示：%s\n", note)
 	}
-	fmt.Fprintf(out, "HTTP 服務已啟動：http://%s （/health 存活、/ready 就緒、/time 伺服器時間）\n", ln.Addr())
+	fmt.Fprintf(out, "Web 介面：%s\n", webStatus.Summary())
+	fmt.Fprintf(out, "HTTP 服務已啟動：http://%s （%s）\n", ln.Addr(), endpointsNote(webStatus))
 
 	serveErr := make(chan error, 1)
 	go func() { serveErr <- srv.Serve(ln) }()

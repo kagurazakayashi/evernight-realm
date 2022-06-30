@@ -1,8 +1,10 @@
 // Package httpapi 提供服務端 HTTP 層：路由掛載、中介層鏈、統一錯誤信封與存活檢查端點。
 //
-// 業務端點一律掛在根路徑（無版本前綴，依 S02 決策），由 registerRoutes 集中登記。
+// 業務端點一律掛在根路徑（無版本前綴，依 S02 決策），由 apiRoutes 集中登記。
 // 基礎端點有三個：/health 回答進程存活、/ready 回答依賴（資料庫）就緒與否、
 // /time 回答伺服器當前時間與顯示時區；三者都是 GET/HEAD，且不採信請求內容提供的時間。
+// 其餘路徑由 web 層接手：內嵌的 Flutter Web 產物以同一路徑空間提供靜態資源，
+// 深連結回退應用外殼；未內嵌產物時這些路徑一律回統一 404 信封（見 web.go）。
 // 輸入保護（請求體上限、處理期限、連線層期限、JSON 解碼限制）於中介層與 http.Server 設定；
 // 安全回應頭（CSP、內容型別保護、Frame 限制等）由 withSecurityHeaders 對所有回應套用。
 package httpapi
@@ -11,6 +13,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io/fs"
 	"log"
 	"net"
 	"net/http"
@@ -30,6 +33,11 @@ type Deps struct {
 	Ready func(context.Context) error
 	// Clock 為業務時間來源；為 nil 時採用 timeutil.System()。
 	Clock timeutil.Clock
+	// Web 為可對外服務的靜態產物檔案系統（根目錄即產物根）。
+	// 為 nil 表示本執行檔沒有可用的網頁介面：/ 與未知路徑回到統一 404 信封，
+	// 協定層行為與尚未內嵌 Web 的版次逐字相同。是否「可用」由呼叫端判定
+	// （internal/app 取 internal/webassets 的結果），傳輸層不自行猜測內嵌格式。
+	Web fs.FS
 }
 
 // Server 為 HTTP 服務層。
@@ -51,6 +59,8 @@ type Server struct {
 	clock timeutil.Clock
 	// displayZone 為啟動時由組態解析出的顯示時區，供時間回應輸出 UTC 偏移。
 	displayZone *time.Location
+	// web 為內嵌的靜態產物（可為 nil）；nil 時所有非端點路徑回到統一 404 信封。
+	web fs.FS
 }
 
 // New 以組態、版本字串與外部依賴建立 HTTP 服務層；伺服器端日誌固定寫往標準錯誤輸出。
@@ -69,6 +79,7 @@ func New(cfg *config.Config, version string, deps Deps) *Server {
 		ready:       deps.Ready,
 		clock:       clock,
 		displayZone: cfg.DisplayLocation(),
+		web:         deps.Web,
 	}
 	s.httpSrv = &http.Server{
 		Addr:    cfg.Server.Listen,
@@ -107,12 +118,17 @@ func (s *Server) wrap(h http.Handler) http.Handler {
 	return chain(h, s.withSecurityHeaders, s.withRequestID, s.withCORS, s.withRecovery, s.withTimeout, s.withBodyLimit)
 }
 
-// registerRoutes 集中登記路由；未登記的路徑與不支援的方法都回傳統一錯誤信封。
+// registerRoutes 集中登記路由：先登記全部 API 端點，再把其餘路徑交給靜態服務與回退。
+//
+// 回退用的「API 首段清單」直接由這份登記清單派生（見 apiRoutes），因此新增端點時
+// 不需要在第二處聲明「這個前綴是我的」；兩處各寫一份的結局是端點開始回傳 HTML。
+// 未命中端點、又不像深連結的路徑（含被拒的方法、隱藏檔案、不存在的檔案）仍回傳統一錯誤信封。
 func (s *Server) registerRoutes(mux *http.ServeMux) {
-	mux.HandleFunc("/health", s.allowMethods(s.handleHealth, http.MethodGet, http.MethodHead))
-	mux.HandleFunc("/ready", s.allowMethods(s.handleReady, http.MethodGet, http.MethodHead))
-	mux.HandleFunc("/time", s.allowMethods(s.handleTime, http.MethodGet, http.MethodHead))
-	mux.HandleFunc("/", s.handleNotFound)
+	routes := s.apiRoutes()
+	for _, route := range routes {
+		mux.Handle(route.pattern, route.handler)
+	}
+	mux.Handle("/", s.webHandler(apiFirstSegments(routes)))
 }
 
 // allowMethods 包裝處理函式，只放行指定方法；其他方法回 405 並附 Allow 標頭。
@@ -252,9 +268,4 @@ func (s *Server) handleTime(w http.ResponseWriter, r *http.Request) {
 		UTCOffsetSeconds: offset,
 		RequestID:        requestIDFromRequest(r),
 	})
-}
-
-// handleNotFound 為未登記路徑的統一 404 回應。
-func (s *Server) handleNotFound(w http.ResponseWriter, r *http.Request) {
-	writeError(w, r, CodeNotFound, http.StatusNotFound)
 }

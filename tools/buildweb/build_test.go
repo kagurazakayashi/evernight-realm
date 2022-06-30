@@ -8,6 +8,8 @@ import (
 	"runtime"
 	"strings"
 	"testing"
+
+	"github.com/kagurazakayashi/evernight-realm/internal/webassets/bundle"
 )
 
 func TestBuildArgs(t *testing.T) {
@@ -212,9 +214,14 @@ func TestFlutterCommandRun(t *testing.T) {
 }
 
 func TestCleanOutput(t *testing.T) {
-	t.Run("目錄不存在時不報錯", func(t *testing.T) {
-		if err := cleanOutput(filepath.Join(t.TempDir(), "nope"), &strings.Builder{}); err != nil {
+	t.Run("目錄不存在時建立目錄與佔位檔", func(t *testing.T) {
+		out := filepath.Join(t.TempDir(), "nope")
+		var stdout strings.Builder
+		if err := cleanOutput(out, &stdout); err != nil {
 			t.Fatalf("不應失敗: %v", err)
+		}
+		if !fileExists(filepath.Join(out, bundle.PlaceholderName)) {
+			t.Error("空目錄會讓 go:embed 直接編譯失敗，必須留下佔位檔讓後端仍可建置")
 		}
 	})
 
@@ -226,11 +233,27 @@ func TestCleanOutput(t *testing.T) {
 		if err := cleanOutput(out, &stdout); err != nil {
 			t.Fatalf("不應失敗: %v", err)
 		}
-		if _, err := os.Stat(out); !errors.Is(err, os.ErrNotExist) {
-			t.Errorf("產物目錄應已被移除，實際 err=%v", err)
+		// 舊產物必須消失（否則會被一起內嵌進發布檔），但佔位檔要留下：
+		// 清空之後若建置失敗，空目錄會讓整個後端連編譯都過不了，而錯誤訊息指不到是前端沒建置。
+		if _, err := os.Stat(filepath.Join(out, "main.dart.js")); !errors.Is(err, os.ErrNotExist) {
+			t.Errorf("舊產物應已被移除，實際 err=%v", err)
+		}
+		entries, err := os.ReadDir(out)
+		if err != nil {
+			t.Fatalf("產物目錄應仍存在: %v", err)
+		}
+		if len(entries) != 1 || entries[0].Name() != bundle.PlaceholderName {
+			names := make([]string, 0, len(entries))
+			for _, entry := range entries {
+				names = append(names, entry.Name())
+			}
+			t.Errorf("清空後只該剩佔位檔，實際 %v", names)
 		}
 		if !strings.Contains(stdout.String(), "已清空") {
 			t.Errorf("應留下清空紀錄: %q", stdout.String())
+		}
+		if !strings.Contains(stdout.String(), bundle.PlaceholderName) {
+			t.Errorf("應說明補回了佔位檔: %q", stdout.String())
 		}
 	})
 

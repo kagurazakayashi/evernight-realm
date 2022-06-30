@@ -18,6 +18,7 @@ import (
 	"github.com/kagurazakayashi/evernight-realm/internal/config"
 	"github.com/kagurazakayashi/evernight-realm/internal/database"
 	"github.com/kagurazakayashi/evernight-realm/internal/database/migrate"
+	"github.com/kagurazakayashi/evernight-realm/internal/webassets"
 )
 
 // syncBuffer 為可跨 goroutine 讀寫的輸出緩衝（run 在背景寫入，測試同步讀取）。
@@ -423,5 +424,158 @@ func TestMigrateRejectedWhileDatabaseInUse(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "單寫入實例約束") {
 		t.Fatalf("錯誤訊息應指出單寫入實例約束，實際: %v", err)
+	}
+}
+
+// TestEndpointsNoteFollowsWebStatus 驗證啟動行的端點清單與內嵌判定一致。
+//
+// 列不列「/ 網頁介面」取決於執行檔裡到底有沒有可用的產物：寫了卻回 404，
+// 人會先去試那個位址，然後才發現前端根本沒建置。
+func TestEndpointsNoteFollowsWebStatus(t *testing.T) {
+	available := endpointsNote(webassets.Status{Available: true, Files: 43})
+	if !strings.Contains(available, "/ 網頁介面") {
+		t.Errorf("可用時應列舉 / ，實際 %q", available)
+	}
+	for _, want := range []string{"/health 存活", "/ready 就緒", "/time 伺服器時間"} {
+		if !strings.Contains(available, want) {
+			t.Errorf("端點清單應含 %q，實際 %q", want, available)
+		}
+	}
+
+	missing := endpointsNote(webassets.Status{Reason: "產物不完整，缺少必要檔案 index.html"})
+	if strings.Contains(missing, "/ 網頁介面") {
+		t.Errorf("不可用時不應列舉 / ，實際 %q", missing)
+	}
+	if !strings.Contains(missing, "/health 存活") {
+		t.Errorf("不可用時仍要列舉三個基礎端點，實際 %q", missing)
+	}
+}
+
+// TestRunReportsWebBundle 驗證啟動輸出把內嵌 Web 產物的狀態講清楚，且與判定結果同源。
+func TestRunReportsWebBundle(t *testing.T) {
+	dir := t.TempDir()
+	probe, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("取測試連接埠失敗: %v", err)
+	}
+	listen := probe.Addr().String()
+	_ = probe.Close()
+	t.Setenv("ER_SERVER_LISTEN", listen)
+
+	out := &syncBuffer{}
+	runCtx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	runErr := make(chan error, 1)
+	go func() { runErr <- run(runCtx, func() {}, []string{"--data-dir", dir}, out) }()
+
+	waitForListenAddr(t, out, runErr)
+	_, status := webassets.Dist()
+
+	got := out.String()
+	if !strings.Contains(got, "Web 介面："+status.Summary()) {
+		t.Fatalf("啟動輸出應原樣帶上內嵌判定，實際：%s", got)
+	}
+	if !strings.Contains(got, "（"+endpointsNote(status)+"）") {
+		t.Fatalf("端點清單應與內嵌判定一致，實際：%s", got)
+	}
+
+	// 判定與摘要必須是同一次結論：兩處各查一次就會出現「說有卻沒有」的那一行。
+	for _, line := range strings.Split(got, "\n") {
+		switch {
+		case strings.HasPrefix(line, "Web 介面："):
+			if status.Available != strings.Contains(line, "已內嵌") {
+				t.Errorf("Web 介面行與判定不一致: %q（可用=%v）", line, status.Available)
+			}
+		case strings.Contains(line, "HTTP 服務已啟動："):
+			if status.Available != strings.Contains(line, "/ 網頁介面") {
+				t.Errorf("啟動行與判定不一致: %q（可用=%v）", line, status.Available)
+			}
+		}
+	}
+
+	cancel()
+	select {
+	case err := <-runErr:
+		if err != nil {
+			t.Fatalf("收到停止請求後 run 應正常結束，實際: %v", err)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("收到停止請求後 run 未在期限內結束")
+	}
+}
+
+// TestRunServesEmbeddedWebWhenAvailable 用真實內嵌產物起服務，驗收「單一封檔能開首頁」。
+//
+// 產物是否內取決於工作樹裡有沒有跑過前端建置，因此兩種結果都要能被接受：
+// 可用時 / 必須回 HTML 外殼，不可用時 / 必須回統一 404 信封——兩者都不該是第三種答案。
+func TestRunServesEmbeddedWebWhenAvailable(t *testing.T) {
+	dir := t.TempDir()
+	probe, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("取測試連接埠失敗: %v", err)
+	}
+	listen := probe.Addr().String()
+	_ = probe.Close()
+	t.Setenv("ER_SERVER_LISTEN", listen)
+
+	out := &syncBuffer{}
+	runCtx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	runErr := make(chan error, 1)
+	go func() { runErr <- run(runCtx, func() {}, []string{"--data-dir", dir}, out) }()
+
+	addr := waitForListenAddr(t, out, runErr)
+	_, status := webassets.Dist()
+
+	resp, err := http.Get("http://" + addr + "/")
+	if err != nil {
+		t.Fatalf("GET / 失敗: %v", err)
+	}
+	defer resp.Body.Close()
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatalf("讀取回應失敗: %v", err)
+	}
+
+	switch {
+	case status.Available:
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("內嵌產物可用時 / 應回 200，實際 %d", resp.StatusCode)
+		}
+		if !strings.HasPrefix(resp.Header.Get("Content-Type"), "text/html") {
+			t.Errorf("回應應是 HTML，實際 %q", resp.Header.Get("Content-Type"))
+		}
+		if !strings.Contains(string(body), "<base href") {
+			t.Errorf("回應應是 Flutter Web 外殼，實際 %q", body)
+		}
+	default:
+		if resp.StatusCode != http.StatusNotFound {
+			t.Fatalf("未內嵌產物時 / 應回 404，實際 %d", resp.StatusCode)
+		}
+		if !strings.HasPrefix(resp.Header.Get("Content-Type"), "application/json") {
+			t.Errorf("未內嵌時 / 應回 JSON 信封，實際 %q", resp.Header.Get("Content-Type"))
+		}
+	}
+
+	// 端點合同不受內嵌影響。
+	health, err := http.Get("http://" + addr + "/health")
+	if err != nil {
+		t.Fatalf("GET /health 失敗: %v", err)
+	}
+	defer health.Body.Close()
+	if health.StatusCode != http.StatusOK {
+		t.Errorf("內嵌後 /health 應仍回 200，實際 %d", health.StatusCode)
+	}
+
+	cancel()
+	select {
+	case err := <-runErr:
+		if err != nil {
+			t.Fatalf("收到停止請求後 run 應正常結束，實際: %v", err)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("收到停止請求後 run 未在期限內結束")
 	}
 }

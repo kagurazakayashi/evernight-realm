@@ -7,7 +7,6 @@ package httpapi
 import (
 	"bytes"
 	"io"
-	"log"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -57,7 +56,7 @@ func newWebServer(t *testing.T, fsys fstest.MapFS) (*httptest.Server, *bytes.Buf
 	cfg := config.Default()
 	srv := New(&cfg, testVersion, deps)
 	var logBuf bytes.Buffer
-	srv.logger = log.New(&logBuf, "", 0)
+	srv.logger = testLogger(&logBuf)
 	ts := httptest.NewServer(srv.Handler())
 	t.Cleanup(ts.Close)
 	return ts, &logBuf

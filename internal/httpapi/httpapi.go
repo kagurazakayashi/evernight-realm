@@ -7,17 +7,20 @@
 // 深連結回退應用外殼；未內嵌產物時這些路徑一律回統一 404 信封（見 web.go）。
 // 輸入保護（請求體上限、處理期限、連線層期限、JSON 解碼限制）於中介層與 http.Server 設定；
 // 安全回應頭（CSP、內容型別保護、Frame 限制等）由 withSecurityHeaders 對所有回應套用。
+// 每個請求由 withAccessLog 留一列結構化訪問日誌（方法、路徑、狀態、時間、來源位址與關聯 ID）；
+// 本層只把記錄交給注入的出口，日誌的去處、層級與脫敏由 internal/runlog 與組合層負責。
 package httpapi
 
 import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"io/fs"
 	"log"
+	"log/slog"
 	"net"
 	"net/http"
-	"os"
 	"strings"
 	"time"
 
@@ -38,13 +41,20 @@ type Deps struct {
 	// 協定層行為與尚未內嵌 Web 的版次逐字相同。是否「可用」由呼叫端判定
 	// （internal/app 取 internal/webassets 的結果），傳輸層不自行猜測內嵌格式。
 	Web fs.FS
+	// Log 為伺服器端記錄出口；為 nil 時記錄被丟棄。
+	// 日誌的去處（檔案、標準錯誤、層級、脫敏規則）由組合層決定，
+	// 傳輸層只交出「發生了什麼」——否則每個子系統會各自開一條日誌管線。
+	Log *slog.Logger
+	// ErrorLog 為 net/http 自身錯誤訊息的寫入去處（畸形請求行、標頭超限、交握失敗）。
+	// 組合層給的是「會把整行轉成結構化記錄」的寫入器；為 nil 時丟棄。
+	ErrorLog io.Writer
 }
 
 // Server 為 HTTP 服務層。
 type Server struct {
 	cfg     *config.Config
 	version string
-	logger  *log.Logger
+	logger  *slog.Logger
 	httpSrv *http.Server
 	// secHeaders 為啟動時算好的安全回應頭（組態留空時為內建基線）。
 	secHeaders securityHeaderSet
@@ -63,16 +73,24 @@ type Server struct {
 	web fs.FS
 }
 
-// New 以組態、版本字串與外部依賴建立 HTTP 服務層；伺服器端日誌固定寫往標準錯誤輸出。
+// New 以組態、版本字串與外部依賴建立 HTTP 服務層。
 func New(cfg *config.Config, version string, deps Deps) *Server {
 	clock := deps.Clock
 	if clock == nil {
 		clock = timeutil.System()
 	}
+	logger := deps.Log
+	if logger == nil {
+		logger = slog.New(slog.DiscardHandler)
+	}
+	errorLog := deps.ErrorLog
+	if errorLog == nil {
+		errorLog = io.Discard
+	}
 	s := &Server{
 		cfg:         cfg,
 		version:     version,
-		logger:      log.New(os.Stderr, "evernight-server ", log.LstdFlags),
+		logger:      logger,
 		secHeaders:  buildSecurityHeaders(cfg),
 		cors:        buildCORSPolicy(cfg),
 		newID:       idgen.New,
@@ -91,7 +109,9 @@ func New(cfg *config.Config, version string, deps Deps) *Server {
 		IdleTimeout:       time.Duration(cfg.Server.IdleTimeoutMS) * time.Millisecond,
 		// 標頭總量上限：一般請求（含 Cookie）遠低於此值，用於擋標頭洪水。
 		MaxHeaderBytes: maxHeaderBytes,
-		ErrorLog:       s.logger,
+		// net/http 的錯誤訊息內容是任意文字（可能含請求行原字），一律經組合層給的
+		// 寫入器轉成記錄後才落地；前綴留空是刻意的——時間由記錄本身攜帶。
+		ErrorLog: log.New(errorLog, "", 0),
 	}
 	return s
 }
@@ -107,15 +127,19 @@ func (s *Server) Handler() http.Handler {
 }
 
 // wrap 為路由樹套上完整中介層鏈（測試亦以本方法組裝，確保與正式路徑一致）。
-// 中介層由外而內為：安全回應頭 → 請求關聯 ID → 跨域標頭 → panic 恢復 → 處理期限 → 請求體上限 → 路由。
+// 中介層由外而內為：安全回應頭 → 請求關聯 ID → 訪問日誌 → 跨域標頭 → panic 恢復 → 處理期限 → 請求體上限 → 路由。
 //
 // 跨域放在關聯 ID 之後、panic 恢復之前：預檢與被拒的來源也要能對應到日誌裡的
 // request_id；而它必須在請求體上限之外——OPTIONS 預檢沒有本體，不該被本體規則波及。
 //
 // 安全回應頭固定最外層，讓鏈上任何一層自行寫出的回應（含無法產生關聯 ID 時的拒絕）
 // 都帶著標頭，不外洩未受保護的回應。
+//
+// 訪問日誌緊跟在關聯 ID 之後：這樣一筆記錄同時取得到 request_id，也罩得住後續每一層
+// 自己寫出的回應（含 panic 恢復的 500 與預檢的 204）。放在跨域之內的話，
+// 被跨域規則擋掉的請求就不會留下任何痕跡。
 func (s *Server) wrap(h http.Handler) http.Handler {
-	return chain(h, s.withSecurityHeaders, s.withRequestID, s.withCORS, s.withRecovery, s.withTimeout, s.withBodyLimit)
+	return chain(h, s.withSecurityHeaders, s.withRequestID, s.withAccessLog, s.withCORS, s.withRecovery, s.withTimeout, s.withBodyLimit)
 }
 
 // registerRoutes 集中登記路由：先登記全部 API 端點，再把其餘路徑交給靜態服務與回退。
@@ -230,7 +254,7 @@ func (s *Server) handleReady(w http.ResponseWriter, r *http.Request) {
 		ctx, cancel := context.WithTimeout(r.Context(), readyCheckTimeout)
 		defer cancel()
 		if err := s.ready(ctx); err != nil {
-			s.logger.Printf("就緒檢查失敗：request_id=%s err=%v", requestIDFromRequest(r), err)
+			s.logger.Error("就緒檢查失敗", "request_id", requestIDFromRequest(r), "err", err)
 			writeError(w, r, CodeNotReady, http.StatusServiceUnavailable)
 			return
 		}

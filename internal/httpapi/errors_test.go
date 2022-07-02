@@ -5,7 +5,6 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
-	"log"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -197,7 +196,7 @@ func TestRequestIDGenerationFailureRejectsRequest(t *testing.T) {
 	var logBuf bytes.Buffer
 	cfg := config.Default()
 	srv := New(&cfg, testVersion, Deps{})
-	srv.logger = log.New(&logBuf, "", 0)
+	srv.logger = testLogger(&logBuf)
 	srv.newID = func() (idgen.ID, error) { return idgen.Nil, errors.New(cause) }
 
 	ts := httptest.NewServer(srv.Handler())
@@ -261,7 +260,7 @@ func TestPanicRecoveryReturnsEnvelopeAndLogsID(t *testing.T) {
 	var logBuf bytes.Buffer
 	cfg := config.Default()
 	srv := New(&cfg, testVersion, Deps{})
-	srv.logger = log.New(&logBuf, "", 0)
+	srv.logger = testLogger(&logBuf)
 
 	panicking := http.HandlerFunc(func(http.ResponseWriter, *http.Request) {
 		panic(secret)

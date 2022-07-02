@@ -46,6 +46,9 @@ backups: "backups/"                 # 備份
 logs:
   dir: "logs/"
   level: "info"                     # debug | info | warn | error
+  file_prefix: "evernight-run"      # 當日檔案名為 <前綴>.<YYYY-MM-DD>.log
+  retention_days: 0                 # 保留天數（含當日）；0 = 不限制、永不自動刪除
+                                    # 想讓「日誌不會無限增大」必須在這裡設一個正值
 
 # ---- 安全（部署者自行生成，勿在此提交真實值） ----
 security:

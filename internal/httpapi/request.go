@@ -39,8 +39,11 @@ func (s *Server) withTimeout(next http.Handler) http.Handler {
 		if !errors.Is(ctx.Err(), context.DeadlineExceeded) {
 			return
 		}
-		s.logger.Printf("請求處理逾時：request_id=%s method=%s path=%s timeout=%s",
-			requestIDFromRequest(r), r.Method, r.URL.Path, timeout)
+		s.logger.Warn("請求處理逾時",
+			"request_id", requestIDFromRequest(r),
+			"method", r.Method,
+			"path", r.URL.Path,
+			"timeout", timeout.String())
 		if recorder.wrote {
 			return
 		}

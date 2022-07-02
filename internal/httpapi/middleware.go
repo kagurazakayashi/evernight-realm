@@ -60,7 +60,7 @@ func (s *Server) withRequestID(next http.Handler) http.Handler {
 		if !validRequestID(id) {
 			gen, err := s.newID()
 			if err != nil {
-				s.logger.Printf("產生請求關聯 ID 失敗：method=%s path=%s err=%v", r.Method, r.URL.Path, err)
+				s.logger.Error("產生請求關聯 ID 失敗", "method", r.Method, "path", r.URL.Path, "err", err)
 				writeError(w, r, CodeUnknown, http.StatusInternalServerError)
 				return
 			}
@@ -107,6 +107,9 @@ func (rec *responseRecorder) Unwrap() http.ResponseWriter { return rec.ResponseW
 // withRecovery 攔截處理函式中的 panic：完整資訊（含關聯 ID 與堆疊）只寫入伺服器端日誌，
 // 對外回傳統一的內部錯誤信封，不洩漏堆疊或 panic 內容。
 // http.ErrAbortHandler 屬連線中止的既有語意，交還 net/http 處理而不記為異常。
+//
+// 堆疊以一個欄位交給記錄層，不在這裡截短：單欄位長度上限與憑證遮罩都由 runlog 統一處理，
+// 兩處各裁一次就變成「這個長度是誰決定的」查不出來。
 func (s *Server) withRecovery(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		recorder := &responseRecorder{ResponseWriter: w}
@@ -118,8 +121,12 @@ func (s *Server) withRecovery(next http.Handler) http.Handler {
 			if recovered == http.ErrAbortHandler {
 				panic(recovered)
 			}
-			s.logger.Printf("已攔截 panic：request_id=%s method=%s path=%s panic=%v\n%s",
-				requestIDFromRequest(r), r.Method, r.URL.Path, recovered, debug.Stack())
+			s.logger.Error("已攔截 panic",
+				"request_id", requestIDFromRequest(r),
+				"method", r.Method,
+				"path", r.URL.Path,
+				"panic", recovered,
+				"stack", string(debug.Stack()))
 			if recorder.wrote {
 				// 回應已開始送出，狀態碼無法改寫，僅中止本次處理。
 				return

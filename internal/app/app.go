@@ -8,6 +8,7 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"log/slog"
 	"os"
 	"os/signal"
 	"strings"
@@ -18,6 +19,7 @@ import (
 	"github.com/kagurazakayashi/evernight-realm/internal/database"
 	"github.com/kagurazakayashi/evernight-realm/internal/database/migrate"
 	"github.com/kagurazakayashi/evernight-realm/internal/httpapi"
+	"github.com/kagurazakayashi/evernight-realm/internal/runlog"
 	"github.com/kagurazakayashi/evernight-realm/internal/timeutil"
 	"github.com/kagurazakayashi/evernight-realm/internal/webassets"
 )
@@ -38,7 +40,7 @@ func Run(args []string) error {
 	if len(args) > 0 && args[0] == "migrate" {
 		return Migrate(ctx, args[1:], os.Stdout)
 	}
-	return run(ctx, releaseSignals, args, os.Stdout)
+	return run(ctx, releaseSignals, args, os.Stdout, os.Stderr)
 }
 
 // Migrate 執行 `evernight-server migrate`：套用未套用的資料庫遷移後結束，不啟動 HTTP 服務。
@@ -49,22 +51,32 @@ func Run(args []string) error {
 // 遷移失敗回傳錯誤（結束碼非 0），失敗的那一支已整體回滾，資料庫維持原版本。
 func Migrate(ctx context.Context, args []string, out io.Writer) error {
 	dryRun, verify, rest := parseMigrateArgs(args)
-	_, db, err := prepare(ctx, rest)
+	// migrate 是一次性命令：報告走 out、結束碼表達成敗，人類可讀日誌因此丟棄，
+	// 免得終端同時出現兩種格式的同一句話。日誌檔案仍照常記錄（含失敗原因）。
+	cfg, lg, db, err := prepare(ctx, rest, io.Discard)
 	if err != nil {
+		if lg != nil {
+			_ = lg.Close()
+		}
 		return err
 	}
 	defer func() {
 		if err := db.Close(); err != nil {
 			fmt.Fprintf(out, "關閉資料庫失敗：%v\n", err)
-			return
+		} else {
+			fmt.Fprintln(out, "資料庫已關閉，單寫入實例鎖已釋放。")
 		}
-		fmt.Fprintln(out, "資料庫已關閉，單寫入實例鎖已釋放。")
+		if err := lg.Close(); err != nil {
+			fmt.Fprintf(out, "關閉日誌失敗：%v\n", err)
+		}
 	}()
+	lg.Info("遷移子命令開始", "dry_run", dryRun, "verify", verify)
 
 	fmt.Fprintf(out, "evernight-server %s\n", Version)
 	// --verify 為自檢模式：只做完整性與版本檢查，不套用任何遷移（等同 --dry-run 再加完整性自檢）。
 	if verify {
 		if err := db.CheckIntegrity(ctx); err != nil {
+			lg.Error("資料庫自檢失敗", "path", cfg.Database.Path, "err", err)
 			return err
 		}
 		fmt.Fprintln(out, "資料庫自檢：integrity_check=ok，foreign_key_check=無違規")
@@ -72,10 +84,12 @@ func Migrate(ctx context.Context, args []string, out io.Writer) error {
 	}
 	res, err := migrate.Apply(ctx, db.SQL(), migrate.Options{DryRun: dryRun, Clock: timeutil.System()})
 	if err != nil {
+		lg.Error("資料庫遷移失敗", "err", err, "dry_run", dryRun)
 		return err
 	}
 
 	if dryRun {
+		lg.Info("資料庫版本檢查完成（未變更資料）", "version", res.FromVersion, "pending", len(res.Pending))
 		fmt.Fprintf(out, "資料庫版本檢查（不變更資料）：目前 version=%d，待套用 %d 項\n", res.FromVersion, len(res.Pending))
 		for _, m := range res.Pending {
 			fmt.Fprintf(out, "  - %s\n", m)
@@ -84,8 +98,10 @@ func Migrate(ctx context.Context, args []string, out io.Writer) error {
 	}
 
 	if err := stampApplicationID(ctx, db); err != nil {
+		lg.Error("寫入資料庫識別標記失敗", "err", err)
 		return err
 	}
+	lg.Info("資料庫遷移完成", "from_version", res.FromVersion, "to_version", res.ToVersion, "applied", len(res.Applied))
 	fmt.Fprintln(out, migrationSummary(res))
 	for _, m := range res.Applied {
 		fmt.Fprintf(out, "  - %s\n", m)
@@ -129,6 +145,15 @@ func migrationSummary(res migrate.Result) string {
 		len(res.Applied), res.FromVersion, res.ToVersion, strings.Join(names, "、"))
 }
 
+// retentionNote 把保留天數翻成一句人話：不限制要寫成「不限制」而不是 0，
+// 否則看到 0 的人會以為日誌一份都不留。
+func retentionNote(days int) string {
+	if days <= 0 {
+		return "不限制（不自動刪除）"
+	}
+	return fmt.Sprintf("%d 天（含當日）", days)
+}
+
 // endpointsNote 產生啟動行括號裡的端點清單。
 //
 // 只在內嵌產物可用時列舉「/ 網頁介面」：摘要寫了那個位址卻回 404，比不寫更糟——
@@ -141,12 +166,30 @@ func endpointsNote(status webassets.Status) string {
 	return apiNote
 }
 
-// prepare 依命令列參數載入組態、規範化路徑、建立資料目錄並開啟資料庫。
+// prepare 依命令列參數載入組態、規範化路徑、建立資料目錄、開啟日誌與資料庫。
 //
-// 資料庫開啟即取得單寫入實例鎖；呼叫端負責在結束時呼叫 db.Close 釋放。
-// 啟動流程與 migrate 子命令共用此段，確保兩者的組態與鎖行為完全一致。
+// 日誌先於資料庫開啟：資料庫那邊的失敗（預檢拒絕、目錄不可寫、鎖被佔用）
+// 必須能在日誌裡查得到，否則最需要先留痕的路徑恰好沒有留痕。
+// logStderr 為人類可讀那份日誌的去處（正式路徑給標準錯誤輸出，測試給 io.Discard），
+// 日誌檔案那一層由組態的 logs.dir 決定，兩者跟著同一次 Open 一起成立或一起失敗。
+// 資料庫開啟即取得單寫入實例鎖；呼叫端負責在結束時關閉連線（釋放鎖）與關閉日誌（釋放檔案）。
 // 已知 schema 版本由內嵌遷移推導，用於開庫前預檢的版本比較。
-func prepare(ctx context.Context, args []string) (config.Config, *database.DB, error) {
+// 回傳的 Logger 在非 nil 時一律由呼叫端負責 Close，即使資料庫開啟失敗也一樣。
+func prepare(ctx context.Context, args []string, logStderr io.Writer) (config.Config, *runlog.Logger, *database.DB, error) {
+	cfg, lg, err := openConfig(args, logStderr)
+	if err != nil {
+		return config.Config{}, nil, nil, err
+	}
+	db, err := openDatabase(ctx, cfg, lg)
+	if err != nil {
+		return config.Config{}, lg, nil, err
+	}
+	return cfg, lg, db, nil
+}
+
+// openConfig 解析命令列與組態、準備資料目錄並開啟日誌；失敗時日誌可能尚未開啟，
+// 回傳的錯誤只能由結束碼與標準錯誤輸出交代。
+func openConfig(args []string, logStderr io.Writer) (config.Config, *runlog.Logger, error) {
 	opts, err := config.ParseArgs(args)
 	if err != nil {
 		return config.Config{}, nil, err
@@ -161,20 +204,40 @@ func prepare(ctx context.Context, args []string) (config.Config, *database.DB, e
 	if err := cfg.Prepare(); err != nil {
 		return config.Config{}, nil, err
 	}
-	knownVersion, err := migrate.MaxVersion()
+	lg, err := runlog.Open(runlog.Options{
+		Dir:           cfg.Logs.Dir,
+		FilePrefix:    cfg.Logs.FilePrefix,
+		Level:         cfg.Logs.Level,
+		RetentionDays: cfg.Logs.RetentionDays,
+		// 分檔用的「今天」與 /time 報給客戶端的今天來自同一個來源：顯示時區。
+		Location: cfg.DisplayLocation(),
+		Stderr:   logStderr,
+		Now:      timeutil.System().Now,
+	})
 	if err != nil {
 		return config.Config{}, nil, err
+	}
+	return cfg, lg, nil
+}
+
+// openDatabase 依已解析的組態開啟資料庫連線（含單寫入實例鎖與開庫前預檢）。
+//
+// 失敗一律記一筆後原樣回傳錯誤：錯誤訊息本身已由 config/database 保證不含機密。
+func openDatabase(ctx context.Context, cfg config.Config, lg *runlog.Logger) (*database.DB, error) {
+	knownVersion, err := migrate.MaxVersion()
+	if err != nil {
+		return nil, err
 	}
 	preflight, err := database.ParsePreflight(cfg.Database.Preflight)
 	if err != nil {
-		return config.Config{}, nil, err
+		return nil, err
 	}
 	policy, err := txPolicy(cfg)
 	if err != nil {
-		return config.Config{}, nil, err
+		return nil, err
 	}
 
-	// 資料庫先於監聽器開啟：單寫入實例鎖、預檢或 WAL 無法生效時直接失敗，不占用連接埠。
+	// 資料庫先於監聽器開啟：單寫入實例鎖、預檢或 WAL 無法生效時直接失敗，不佔用連接埠。
 	db, err := database.Open(ctx, database.Options{
 		Path:               cfg.Database.Path,
 		BusyTimeout:        time.Duration(cfg.Database.BusyTimeoutMS) * time.Millisecond,
@@ -183,9 +246,10 @@ func prepare(ctx context.Context, args []string) (config.Config, *database.DB, e
 		TxPolicy:           policy,
 	})
 	if err != nil {
-		return config.Config{}, nil, err
+		lg.Error("資料庫開啟失敗", "path", cfg.Database.Path, "err", err)
+		return nil, err
 	}
-	return cfg, db, nil
+	return db, nil
 }
 
 // txPolicy 依組態建立交易策略（STEP-041）。
@@ -215,29 +279,39 @@ func txPolicy(cfg config.Config) (database.TxPolicy, error) {
 //
 // releaseSignals 於停止流程開始時呼叫，用以還原預設訊號處理，
 // 使停止期間再次按 Ctrl+C 可立即中止，不必等完優雅停止期限。
-// 流程：解析命令列 → 載入並校驗組態 → 路徑規範化 → 資料目錄初始化
+// 流程：解析命令列 → 載入並校驗組態 → 路徑規範化 → 資料目錄初始化 → 日誌開啟
 // → 資料庫連線（單寫入實例鎖 + 開庫前預檢）→ 資料庫遷移（含檔頭標記）
-// → 監聽 → 輸出脫敏摘要與監聽提示 → 服務至停止請求 → 優雅停止 → 關閉資料庫並釋放鎖。
+// → 監聽 → 輸出脫敏摘要與監聽提示 → 服務至停止請求 → 優雅停止 → 關閉資料庫並釋放鎖、關閉日誌。
 // 組態非法、目錄不可用或資料庫無法開啟時回傳錯誤（含欄位路徑，不含機密），
-// 由 main 決定結束碼。
-func run(ctx context.Context, releaseSignals func(), args []string, out io.Writer) error {
-	cfg, db, err := prepare(ctx, args)
+// 由 main 決定結束碼；已開啟的日誌在任何結束路徑都會關閉。
+// out 為啟動/停止摘要的去處，logStderr 為人類可讀日誌的去處（正式路徑兩者皆標準輸出串，
+// 但分別是 stdout 與 stderr；測試把後者給 io.Discard 以保持輸出乾淨）。
+func run(ctx context.Context, releaseSignals func(), args []string, out io.Writer, logStderr io.Writer) error {
+	cfg, lg, db, err := prepare(ctx, args, logStderr)
 	if err != nil {
+		if lg != nil {
+			_ = lg.Close()
+		}
 		return err
 	}
-	// defer 確保任何結束路徑都會釋放連線池與鎖。
+	// defer 確保任何結束路徑都會釋放連線池、鎖與日誌檔案。
 	defer func() {
 		if err := db.Close(); err != nil {
 			fmt.Fprintf(out, "關閉資料庫失敗：%v\n", err)
-			return
+		} else {
+			fmt.Fprintln(out, "資料庫已關閉，單寫入實例鎖已釋放。")
 		}
-		fmt.Fprintln(out, "資料庫已關閉，單寫入實例鎖已釋放。")
+		if err := lg.Close(); err != nil {
+			fmt.Fprintf(out, "關閉日誌失敗：%v\n", err)
+		}
 	}()
+	lg.Info("服務啟動", "version", Version, "listen", cfg.Server.Listen, "data_dir", cfg.Server.DataDir)
 
 	// 遷移先於監聽器：遷移失敗即中止啟動，不提供服務，
 	// 也不留下半套用的結構（失敗的遷移已整體回滾）。
 	if cfg.Database.IntegrityCheck {
 		if err := db.CheckIntegrity(ctx); err != nil {
+			lg.Error("資料庫完整性自檢失敗", "path", cfg.Database.Path, "err", err)
 			return err
 		}
 		fmt.Fprintln(out, "資料庫完整性自檢：integrity_check=ok，foreign_key_check=無違規")
@@ -245,9 +319,11 @@ func run(ctx context.Context, releaseSignals func(), args []string, out io.Write
 	// 遷移記錄的時間戳取自伺服器時鐘；業務時間不得取自請求內容（規格 §27.2）。
 	res, err := migrate.Apply(ctx, db.SQL(), migrate.Options{Clock: timeutil.System()})
 	if err != nil {
+		lg.Error("資料庫遷移失敗", "err", err)
 		return err
 	}
 	if err := stampApplicationID(ctx, db); err != nil {
+		lg.Error("寫入資料庫識別標記失敗", "err", err)
 		return err
 	}
 
@@ -257,14 +333,23 @@ func run(ctx context.Context, releaseSignals func(), args []string, out io.Write
 	// 內嵌的 Web 產物只在判定可用時掛上路徑，不可用時啟動摘要如實寫出缺什麼
 	// （判定由 internal/webassets 完成，傳輸層只收到一份檔案系統或 nil）。
 	webFS, webStatus := webassets.Dist()
-	srv := httpapi.New(&cfg, Version, httpapi.Deps{Ready: db.Ping, Clock: timeutil.System(), Web: webFS})
+	srv := httpapi.New(&cfg, Version, httpapi.Deps{
+		Ready:    db.Ping,
+		Clock:    timeutil.System(),
+		Web:      webFS,
+		Log:      lg.Logger,
+		ErrorLog: lg.ErrorLogWriter(slog.LevelError),
+	})
 	ln, err := srv.Listen()
 	if err != nil {
+		lg.Error("建立監聽器失敗", "listen", cfg.Server.Listen, "err", err)
 		return err
 	}
 
 	fmt.Fprintf(out, "evernight-server %s\n", Version)
 	fmt.Fprintln(out, cfg.Redacted())
+	fmt.Fprintf(out, "運行日誌：%s（層級=%s，按 %s 的自然日分檔，保留=%s；人類可讀一份同時寫入標準錯誤輸出）\n",
+		lg.Path(), cfg.Logs.Level, cfg.Server.DisplayTimezone, retentionNote(cfg.Logs.RetentionDays))
 	if note := db.PreflightNote(); note != "" {
 		fmt.Fprintf(out, "資料庫預檢提示：%s\n", note)
 	}
@@ -282,6 +367,12 @@ func run(ctx context.Context, releaseSignals func(), args []string, out io.Write
 	}
 	fmt.Fprintf(out, "Web 介面：%s\n", webStatus.Summary())
 	fmt.Fprintf(out, "HTTP 服務已啟動：http://%s （%s）\n", ln.Addr(), endpointsNote(webStatus))
+	lg.Info("HTTP 服務已啟動",
+		"listen", ln.Addr().String(),
+		"web_bundle", webStatus.Summary(),
+		"database", db.Path(),
+		"schema_version", res.ToVersion,
+		"cors_origins", strings.Join(cfg.Security.CORS.AllowedOrigins, "|"))
 
 	serveErr := make(chan error, 1)
 	go func() { serveErr <- srv.Serve(ln) }()
@@ -289,6 +380,7 @@ func run(ctx context.Context, releaseSignals func(), args []string, out io.Write
 	select {
 	case err := <-serveErr:
 		// 服務在收到停止請求前自行結束（如監聽器失效）：無優雅停止流程可跑。
+		lg.Error("服務異常終止", "err", err)
 		return err
 	case <-ctx.Done():
 	}
@@ -297,19 +389,24 @@ func run(ctx context.Context, releaseSignals func(), args []string, out io.Write
 	// 逾時則強制關閉連線，確保程序結束並釋放監聽資源。
 	releaseSignals()
 	timeout := srv.ShutdownTimeout()
+	lg.Info("收到停止信號，開始優雅停止", "timeout", timeout.String())
 	fmt.Fprintf(out, "收到停止信號，開始優雅停止（最長等待 %s）\n", timeout)
 
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
 	if err := srv.Shutdown(shutdownCtx); err != nil {
+		lg.Warn("優雅停止逾時，改以強制關閉連線", "err", err)
 		fmt.Fprintf(out, "優雅停止逾時（%v），強制關閉連線\n", err)
 		if closeErr := srv.Close(); closeErr != nil {
+			lg.Error("強制關閉服務失敗", "err", closeErr)
 			return fmt.Errorf("app: 強制關閉服務失敗: %w", closeErr)
 		}
 	}
 	if err := <-serveErr; err != nil {
+		lg.Error("服務異常終止", "err", err)
 		return err
 	}
+	lg.Info("服務已停止，監聽資源已釋放")
 	fmt.Fprintln(out, "服務已停止，監聽資源已釋放。")
 	return nil
 }

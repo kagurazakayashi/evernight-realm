@@ -2,7 +2,6 @@ package httpapi
 
 import (
 	"io"
-	"log"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -84,7 +83,7 @@ func TestSecurityHeadersOnSuccessAndErrorResponses(t *testing.T) {
 	t.Run("panic 回應", func(t *testing.T) {
 		cfg := config.Default()
 		srv := New(&cfg, testVersion, Deps{})
-		srv.logger = log.New(io.Discard, "", 0)
+		srv.logger = testLogger(io.Discard)
 		mux := http.NewServeMux()
 		mux.HandleFunc("/panic", func(http.ResponseWriter, *http.Request) { panic("boom") })
 		panicTS := httptest.NewServer(srv.wrap(mux))

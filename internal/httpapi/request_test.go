@@ -3,7 +3,6 @@ package httpapi
 import (
 	"bytes"
 	"io"
-	"log"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -28,7 +27,7 @@ func newTestJSONServer(t *testing.T, mutate func(*config.Config)) *httptest.Serv
 		mutate(&cfg)
 	}
 	srv := New(&cfg, testVersion, Deps{})
-	srv.logger = log.New(io.Discard, "", 0)
+	srv.logger = testLogger(io.Discard)
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("/json", srv.allowMethods(func(w http.ResponseWriter, r *http.Request) {
@@ -277,7 +276,7 @@ func TestRequestTimeoutReturnsStableError(t *testing.T) {
 	cfg := config.Default()
 	cfg.Server.RequestTimeoutMS = 50
 	srv := New(&cfg, testVersion, Deps{})
-	srv.logger = log.New(&logBuf, "", 0)
+	srv.logger = testLogger(&logBuf)
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("/slow", func(w http.ResponseWriter, r *http.Request) {

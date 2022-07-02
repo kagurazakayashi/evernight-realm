@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"database/sql"
+	"encoding/json"
 	"errors"
 	"io"
 	"net"
@@ -18,6 +19,7 @@ import (
 	"github.com/kagurazakayashi/evernight-realm/internal/config"
 	"github.com/kagurazakayashi/evernight-realm/internal/database"
 	"github.com/kagurazakayashi/evernight-realm/internal/database/migrate"
+	"github.com/kagurazakayashi/evernight-realm/internal/runlog"
 	"github.com/kagurazakayashi/evernight-realm/internal/webassets"
 )
 
@@ -81,7 +83,7 @@ func TestRunStopsGracefullyOnContextCancel(t *testing.T) {
 	defer cancel()
 
 	runErr := make(chan error, 1)
-	go func() { runErr <- run(ctx, func() {}, []string{"--data-dir", dir}, out) }()
+	go func() { runErr <- run(ctx, func() {}, []string{"--data-dir", dir}, out, io.Discard) }()
 
 	addr := waitForListenAddr(t, out, runErr)
 	if _, err := net.ResolveTCPAddr("tcp", addr); err != nil {
@@ -144,7 +146,7 @@ func TestRunOwnsDatabaseLockUntilStop(t *testing.T) {
 	defer cancel()
 
 	runErr := make(chan error, 1)
-	go func() { runErr <- run(runCtx, func() {}, []string{"--data-dir", dir}, out) }()
+	go func() { runErr <- run(runCtx, func() {}, []string{"--data-dir", dir}, out, io.Discard) }()
 
 	waitForListenAddr(t, out, runErr)
 	if !strings.Contains(out.String(), "資料庫已就緒") {
@@ -203,7 +205,7 @@ func TestRunAppliesMigrationsBeforeListening(t *testing.T) {
 	defer cancel()
 
 	runErr := make(chan error, 1)
-	go func() { runErr <- run(runCtx, func() {}, []string{"--data-dir", dir}, out) }()
+	go func() { runErr <- run(runCtx, func() {}, []string{"--data-dir", dir}, out, io.Discard) }()
 
 	waitForListenAddr(t, out, runErr)
 	got := out.String()
@@ -349,7 +351,7 @@ database:
 	runCtx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	runErr := make(chan error, 1)
-	go func() { runErr <- run(runCtx, func() {}, []string{"--data-dir", dir}, out) }()
+	go func() { runErr <- run(runCtx, func() {}, []string{"--data-dir", dir}, out, io.Discard) }()
 
 	waitForListenAddr(t, out, runErr)
 	cancel()
@@ -467,7 +469,7 @@ func TestRunReportsWebBundle(t *testing.T) {
 	defer cancel()
 
 	runErr := make(chan error, 1)
-	go func() { runErr <- run(runCtx, func() {}, []string{"--data-dir", dir}, out) }()
+	go func() { runErr <- run(runCtx, func() {}, []string{"--data-dir", dir}, out, io.Discard) }()
 
 	waitForListenAddr(t, out, runErr)
 	_, status := webassets.Dist()
@@ -524,7 +526,7 @@ func TestRunServesEmbeddedWebWhenAvailable(t *testing.T) {
 	defer cancel()
 
 	runErr := make(chan error, 1)
-	go func() { runErr <- run(runCtx, func() {}, []string{"--data-dir", dir}, out) }()
+	go func() { runErr <- run(runCtx, func() {}, []string{"--data-dir", dir}, out, io.Discard) }()
 
 	addr := waitForListenAddr(t, out, runErr)
 	_, status := webassets.Dist()
@@ -578,4 +580,197 @@ func TestRunServesEmbeddedWebWhenAvailable(t *testing.T) {
 	case <-time.After(10 * time.Second):
 		t.Fatal("收到停止請求後 run 未在期限內結束")
 	}
+}
+
+// TestRunWritesStructuredRunLog 驗證「執行期間真的往日誌檔案寫結構化記錄」：
+// 啟動、每一個請求、停止都留痕，且日誌檔案落在資料目錄的 logs/ 之下。
+//
+// 這條是 STEP-063 接線的收口證據：單測裡 httpapi 的記錄出口是注入的緩衝區，
+// 只有走完整啟動流程才證明執行檔自己把出口接上了。
+func TestRunWritesStructuredRunLog(t *testing.T) {
+	dir := t.TempDir()
+	probe, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("取測試連接埠失敗: %v", err)
+	}
+	listen := probe.Addr().String()
+	_ = probe.Close()
+	t.Setenv("ER_SERVER_LISTEN", listen)
+
+	out := &syncBuffer{}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	runErr := make(chan error, 1)
+	go func() { runErr <- run(ctx, func() {}, []string{"--data-dir", dir}, out, io.Discard) }()
+
+	addr := waitForListenAddr(t, out, runErr)
+	// /missing.js 一定會回 404：內嵌產物可用時未知的目錄型路徑會回應用外殼（200），
+	// 而末段帶副檔名的請求被排除在回退之外——取證不該依賴本機是否構建過前端。
+	for _, path := range []string{"/health", "/missing.js"} {
+		resp, err := http.Get("http://" + addr + path)
+		if err != nil {
+			t.Fatalf("GET %s 失敗: %v", path, err)
+		}
+		_ = resp.Body.Close()
+	}
+	cancel()
+	if err := <-runErr; err != nil {
+		t.Fatalf("run 應正常結束，實際: %v", err)
+	}
+
+	// 啟動摘要要把日誌位置講出來：部署者不必猜執行檔把記錄寫去了哪裡。
+	// 日檔以「顯示時區的自然日」命名，本機預設 Asia/Shanghai；跨日邊界的機率極低，
+	// 若真的跨了日，取日誌內容那一段會先失敗而不是假通過。
+	banner := out.String()
+	logPath := filepath.Join(dir, "logs", runlog.LogFileName(runlog.DefaultFilePrefix, time.Now(), cfgLocation()))
+	if !strings.Contains(banner, "運行日誌："+logPath) {
+		t.Errorf("啟動摘要缺少日誌位置：%s", banner)
+	}
+
+	records := readRunLog(t, logPath)
+
+	// 生命週期記錄：啟動、監聽就緒、停止信號與停止完成。
+	for _, want := range []string{
+		"服務啟動", "HTTP 服務已啟動", "收到停止信號，開始優雅停止", "服務已停止，監聽資源已釋放",
+	} {
+		if !containsMsg(records, want) {
+			t.Errorf("日誌缺少記錄 %q，實際：%v", want, msgsOf(records))
+		}
+	}
+	if got := countMsg(records, "請求完成"); got != 2 {
+		t.Errorf("訪問記錄數 = %d，want 2：%v", got, msgsOf(records))
+	}
+
+	// 訪問記錄帶得齊全，且狀態碼與請求對得上。
+	var sawOK, sawMissing bool
+	for _, rec := range records {
+		if rec["msg"] != "請求完成" {
+			continue
+		}
+		id, _ := rec["request_id"].(string)
+		if id == "" {
+			t.Errorf("訪問記錄缺少 request_id：%v", rec)
+		}
+		switch status := rec["status"].(type) {
+		case string:
+			switch status {
+			case "200":
+				sawOK = true
+			case "404":
+				sawMissing = true
+			}
+		case float64:
+			switch int(status) {
+			case http.StatusOK:
+				sawOK = true
+			case http.StatusNotFound:
+				sawMissing = true
+			}
+		}
+	}
+	if !sawOK || !sawMissing {
+		t.Errorf("訪問記錄未涵蓋 200 與 404：%v", records)
+	}
+
+	// 時間戳為 UTC 且格式與協議一致（24 字元、Z 結尾）。
+	for _, rec := range records {
+		stamp, _ := rec["time"].(string)
+		if len(stamp) != 24 || !strings.HasSuffix(stamp, "Z") {
+			t.Errorf("日誌時間戳格式不符：%q", stamp)
+			break
+		}
+	}
+
+	// 日誌落在資料目錄內（規格 §26.4：執行期資料與可執行檔分離）。
+	rel, err := filepath.Rel(dir, logPath)
+	if err != nil || strings.HasPrefix(rel, "..") {
+		t.Errorf("日誌不在資料目錄內：%v", err)
+	}
+
+	// 關閉後檔案必須可以重命名：Windows 上只要還有開啟的句柄，重命名就會失敗，
+	// 而 t.TempDir 的清理會以「The directory is not empty」回報（本機確實出現過該訊號）。
+	// 這條斷言把「我們的句柄沒收乾淨」與「防毒／索引服務與目錄並發」分開——
+	// 前者是缺陷，後者不是；實測本斷言從未失敗，而清理競爭仍在全包併發時出現。
+	if err := os.Rename(logPath, logPath+".moved"); err != nil {
+		t.Fatalf("run 返回後日誌檔案句柄仍未釋放，無法重命名：%v", err)
+	}
+	if err := os.Rename(logPath+".moved", logPath); err != nil {
+		t.Fatalf("還原日誌檔案失敗：%v", err)
+	}
+}
+
+// TestMigrateWritesRunLog 驗證遷移子命令也留痕：它的報告走 stdout，
+// 但成敗必須在日誌檔案裡查得到（一次性命令的終端輸出會隨視窗關閉而消失）。
+func TestMigrateWritesRunLog(t *testing.T) {
+	dir := t.TempDir()
+	var out syncBuffer
+	if err := Migrate(context.Background(), []string{"--data-dir", dir}, &out); err != nil {
+		t.Fatalf("migrate 失敗：%v（輸出：%s）", err, out.String())
+	}
+	logPath := filepath.Join(dir, "logs", runlog.LogFileName(runlog.DefaultFilePrefix, time.Now(), cfgLocation()))
+	records := readRunLog(t, logPath)
+	if !containsMsg(records, "資料庫遷移完成") {
+		t.Errorf("遷移子命令未寫日誌：%v", msgsOf(records))
+	}
+}
+
+// readRunLog 讀回日誌檔案並逐行解析成欄位映射。
+func readRunLog(t *testing.T, path string) []map[string]any {
+	t.Helper()
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("讀取日誌檔案 %s 失敗：%v", path, err)
+	}
+	var records []map[string]any
+	for _, line := range strings.Split(strings.TrimRight(string(data), "\n"), "\n") {
+		if strings.TrimSpace(line) == "" {
+			continue
+		}
+		var rec map[string]any
+		if err := json.Unmarshal([]byte(line), &rec); err != nil {
+			t.Fatalf("日誌行不是合法 JSON：%v（%s）", err, line)
+		}
+		records = append(records, rec)
+	}
+	if len(records) == 0 {
+		t.Fatal("日誌檔案是空的")
+	}
+	return records
+}
+
+// containsMsg 回傳是否有任一筆記錄的 msg 等於或包含指定文字。
+func containsMsg(records []map[string]any, want string) bool {
+	for _, rec := range records {
+		if msg, _ := rec["msg"].(string); strings.Contains(msg, want) {
+			return true
+		}
+	}
+	return false
+}
+
+// countMsg 回傳 msg 等於指定文字的記錄數。
+func countMsg(records []map[string]any, want string) int {
+	n := 0
+	for _, rec := range records {
+		if msg, _ := rec["msg"].(string); msg == want {
+			n++
+		}
+	}
+	return n
+}
+
+// msgsOf 取出全部 msg 供錯誤訊息比對。
+func msgsOf(records []map[string]any) []string {
+	out := make([]string, 0, len(records))
+	for _, rec := range records {
+		msg, _ := rec["msg"].(string)
+		out = append(out, msg)
+	}
+	return out
+}
+
+// cfgLocation 回傳本機組態的顯示時區（測試用：日誌分檔跟的是這個時區的自然日）。
+func cfgLocation() *time.Location {
+	cfg := config.Default()
+	return cfg.DisplayLocation()
 }

@@ -106,9 +106,19 @@ type TransactionConfig struct {
 }
 
 // LogsConfig 為本地日誌組態。
+//
+// 日誌依「顯示時區的自然日」分檔（檔名帶日期，不重命名舊檔），因此同目錄下會隨日期增加檔案；
+// 淘汰只按天數，且預設不淘汰（保留完整歷史直到部署者設定上限）。
 type LogsConfig struct {
 	Dir   string `yaml:"dir"`
 	Level string `yaml:"level"` // debug | info | warn | error
+	// FilePrefix 為日誌檔名前綴；當日檔案名為 `<前綴>.<YYYY-MM-DD>.log`。
+	// 前綴不得含路徑分隔符或 Windows 檔名禁忌字元：它會被直接拼成檔案名。
+	FilePrefix string `yaml:"file_prefix"`
+	// RetentionDays 為日誌保留天數（含當日）；0（預設）表示不限制、不淘汰任何舊檔。
+	// 換言之「日誌不會無限增大」是要部署者明確設定的選項，不是內建行為——
+	// 自動刪檔在活動進行中可能是刪除唯一的事後線索，預設因此偏向保留。
+	RetentionDays int `yaml:"retention_days"`
 }
 
 // SecurityConfig 為安全相關組態。
@@ -197,8 +207,10 @@ func Default() Config {
 		Attachments: "attachments/",
 		Backups:     "backups/",
 		Logs: LogsConfig{
-			Dir:   "logs/",
-			Level: "info",
+			Dir:           "logs/",
+			Level:         "info",
+			FilePrefix:    "evernight-run",
+			RetentionDays: 0,
 		},
 		Security: SecurityConfig{
 			SessionTTLHours: 24,
@@ -392,10 +404,27 @@ func (c *Config) Validate() error {
 	if c.Logs.Dir == "" {
 		return errors.New("config: logs.dir 不可為空")
 	}
+	// 層級名稱先正規化再校驗：環境變數常由 shell 給出（ER_LOGS_LEVEL=DEBUG、尾端空白），
+	// 校驗的門禁照舊，但不要把「大小寫不同」變成啟動失敗。
+	// 正規化放在這一層是因為它是組態邊界的工作，runlog 那邊的容錯只是替直接呼叫者兜底。
+	c.Logs.Level = strings.ToLower(strings.TrimSpace(c.Logs.Level))
 	switch c.Logs.Level {
 	case "debug", "info", "warn", "error":
 	default:
 		return fmt.Errorf("config: logs.level 需為 debug|info|warn|error，實際為 %q", c.Logs.Level)
+	}
+	// 日誌檔名前綴：空值代表採用內建預設（與 Default() 一致）；前後空白一律去掉。
+	c.Logs.FilePrefix = strings.TrimSpace(c.Logs.FilePrefix)
+	if c.Logs.FilePrefix == "" {
+		c.Logs.FilePrefix = Default().Logs.FilePrefix
+	}
+	if err := validateLogFilePrefix(c.Logs.FilePrefix); err != nil {
+		return err
+	}
+	// 保留天數為 0 時不淘汰（預設）；上限只是把「打錯一個大數」攔在啟動階段。
+	if c.Logs.RetentionDays < 0 || c.Logs.RetentionDays > maxLogRetentionDays {
+		return fmt.Errorf("config: logs.retention_days 需為 0（不限制）或 1..%d，實際為 %d",
+			maxLogRetentionDays, c.Logs.RetentionDays)
 	}
 
 	if c.Security.SessionTTLHours < 1 {
@@ -576,6 +605,58 @@ func isHTTPSeparator(c byte) bool {
 	return false
 }
 
+// 日誌保留與檔名前綴的邊界值。
+const (
+	// maxLogRetentionDays 為保留天數上限（十年）：超過這個值通常意味著打錯數字，
+	// 而「不限制」另有 0 這個寫法，不需要靠一個巨大的數字表達。
+	maxLogRetentionDays = 3650
+	// maxLogFilePrefixLen 為日誌檔名前綴長度上限：檔案名還要裝下日期與副檔名，
+	// 過長的前綴在舊版檔案系統上會直接讓建立失敗。
+	maxLogFilePrefixLen = 64
+)
+
+// illegalFileNameChars 為檔案名禁忌字元：路徑分隔符、Windows 保留字元與 DEL。
+//
+// 刻意以碼位而不是字面量寫出：這條規則的全部內容就是幾個標點符號，
+// 而其中反斜線在原始碼、腳本與轉換工具之間最容易被吞掉一層跳脫
+// （本專案已踩過兩次），用 0x5C 就沒有這種風險。
+var illegalFileNameChars = map[rune]bool{
+	0x2F: true, // /
+	0x5C: true, // \
+	0x3A: true, // :
+	0x2A: true, // *
+	0x3F: true, // ?
+	0x22: true, // \"
+	0x3C: true, // <
+	0x3E: true, // >
+	0x7C: true, // |
+	0x7F: true, // DEL
+}
+
+// validateLogFilePrefix 檢查前綴能安全拼進檔案名（<前綴>.YYYY-MM-DD.log）。
+//
+// 這裡攔的是「拼出來之後才發現」的那類問題：含路徑分隔符會把日誌寫到別處、
+// Windows 保留字元會直接建不出檔案。控制字元也要擋，
+// 否則前綴本身就會把終端與檔案總管的顯示搞亂。
+func validateLogFilePrefix(prefix string) error {
+	if prefix == "." || prefix == ".." {
+		return fmt.Errorf("config: logs.file_prefix 不可為 %q（與日期拼出的檔名無效）", prefix)
+	}
+	if len(prefix) > maxLogFilePrefixLen {
+		return fmt.Errorf("config: logs.file_prefix 長度不可超過 %d 個字元，實際為 %d",
+			maxLogFilePrefixLen, len(prefix))
+	}
+	for _, r := range prefix {
+		if illegalFileNameChars[r] {
+			return fmt.Errorf("config: logs.file_prefix 含檔案系統禁忌字元（0x%02X）: %q", r, prefix)
+		}
+		if r < 0x20 {
+			return fmt.Errorf("config: logs.file_prefix 含控制字元（0x%02X）: %q", r, prefix)
+		}
+	}
+	return nil
+}
+
 // 請求體上限的合理區間：過小會使正常 JSON 請求失效，過大則失去保護意義。
 const (
 	minBodyBytes int64 = 1 << 10  // 1 KiB
@@ -606,11 +687,11 @@ func (c Config) DisplayLocation() *time.Location {
 
 // Redacted 回傳組態的脫敏摘要（供啟動日誌），機密欄位一律顯示 [REDACTED]。
 func (c Config) Redacted() string {
-	return fmt.Sprintf("組態摘要：listen=%s data_dir=%s timezone=%s db=%s busy_timeout_ms=%d media=%s documents=%s attachments=%s backups=%s logs_dir=%s logs_level=%s session_ttl_hours=%d root_password_hash=%s http_timeouts_ms=[read_header=%d read=%d write=%d idle=%d request=%d shutdown=%d] max_body_bytes=%d security_headers=[frame_options=%s csp=%s referrer_policy=%s permissions_policy=%s] cors=[%s] tx=[begin_mode=%s nested=%s busy_retry_max=%d busy_retry_backoff_ms=%d timeout_ms=%d schema_guard=%s]",
+	return fmt.Sprintf("組態摘要：listen=%s data_dir=%s timezone=%s db=%s busy_timeout_ms=%d media=%s documents=%s attachments=%s backups=%s logs_dir=%s logs_level=%s logs_prefix=%s logs_retention_days=%d session_ttl_hours=%d root_password_hash=%s http_timeouts_ms=[read_header=%d read=%d write=%d idle=%d request=%d shutdown=%d] max_body_bytes=%d security_headers=[frame_options=%s csp=%s referrer_policy=%s permissions_policy=%s] cors=[%s] tx=[begin_mode=%s nested=%s busy_retry_max=%d busy_retry_backoff_ms=%d timeout_ms=%d schema_guard=%s]",
 		c.Server.Listen, c.Server.DataDir, c.Server.DisplayTimezone,
 		c.Database.Path, c.Database.BusyTimeoutMS,
 		c.Media, c.Documents, c.Attachments, c.Backups,
-		c.Logs.Dir, c.Logs.Level,
+		c.Logs.Dir, c.Logs.Level, c.Logs.FilePrefix, c.Logs.RetentionDays,
 		c.Security.SessionTTLHours, redact(c.Security.RootPasswordHash),
 		c.Server.ReadHeaderTimeoutMS, c.Server.ReadTimeoutMS, c.Server.WriteTimeoutMS,
 		c.Server.IdleTimeoutMS, c.Server.RequestTimeoutMS, c.Server.ShutdownTimeoutMS, c.Server.MaxBodyBytes,
@@ -705,6 +786,7 @@ func applyEnv(cfg *Config) error {
 		{&cfg.Backups, "ER_BACKUPS"},
 		{&cfg.Logs.Dir, "ER_LOGS_DIR"},
 		{&cfg.Logs.Level, "ER_LOGS_LEVEL"},
+		{&cfg.Logs.FilePrefix, "ER_LOGS_FILE_PREFIX"},
 		{&cfg.Security.RootPasswordHash, "ER_SECURITY_ROOT_PASSWORD_HASH"},
 		{&cfg.Security.Headers.ContentSecurityPolicy, "ER_SECURITY_HEADERS_CONTENT_SECURITY_POLICY"},
 		{&cfg.Security.Headers.FrameOptions, "ER_SECURITY_HEADERS_FRAME_OPTIONS"},
@@ -739,6 +821,7 @@ func applyEnv(cfg *Config) error {
 		{&cfg.Database.Transaction.BusyRetryBackoffMS, "ER_DATABASE_TRANSACTION_BUSY_RETRY_BACKOFF_MS"},
 		{&cfg.Database.Transaction.TimeoutMS, "ER_DATABASE_TRANSACTION_TIMEOUT_MS"},
 		{&cfg.Security.SessionTTLHours, "ER_SECURITY_SESSION_TTL_HOURS"},
+		{&cfg.Logs.RetentionDays, "ER_LOGS_RETENTION_DAYS"},
 		{&cfg.Server.ReadHeaderTimeoutMS, "ER_SERVER_READ_HEADER_TIMEOUT_MS"},
 		{&cfg.Server.ReadTimeoutMS, "ER_SERVER_READ_TIMEOUT_MS"},
 		{&cfg.Server.WriteTimeoutMS, "ER_SERVER_WRITE_TIMEOUT_MS"},
@@ -796,6 +879,9 @@ media: "media/"                     # 媒體檔案
 logs:
   dir: "logs/"
   level: "info"                     # debug | info | warn | error
+  file_prefix: "evernight-run"      # 當日檔案名為 <前綴>.<YYYY-MM-DD>.log（依顯示時區的自然日分檔）
+  retention_days: 0                 # 保留天數（含當日）；0 = 不限制、永不自動刪除
+                                    # 要「日誌不會無限增大」必須在這裡設一個正值；淘汰只認得本服務的日誌檔名
 
 security:
   session_ttl_hours: 24

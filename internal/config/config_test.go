@@ -6,6 +6,10 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"gopkg.in/yaml.v3"
+
+	"github.com/kagurazakayashi/evernight-realm/internal/runlog"
 )
 
 // 寫入臨時組態檔並回傳路徑。
@@ -799,4 +803,161 @@ func contains(list []string, want string) bool {
 		}
 	}
 	return false
+}
+
+// TestLogsLevelAgreesWithRunlog 固定「組態接受的層級」與「記錄層接受的層級」是同一份清單。
+//
+// 兩處各寫一份清單時，漏更新的那一份不會讓建置失敗——只會讓某個層級在啟動時被接受、
+// 在開日誌時被拒絕（或反過來），部署者要等到執行檔起不來才知道。
+func TestLogsLevelAgreesWithRunlog(t *testing.T) {
+	for _, name := range []string{"debug", "info", "warn", "error"} {
+		cfg := Default()
+		cfg.Logs.Level = name
+		if err := cfg.Validate(); err != nil {
+			t.Errorf("config 應接受層級 %q：%v", name, err)
+		}
+		if _, err := runlog.ParseLevel(name); err != nil {
+			t.Errorf("runlog 應接受層級 %q（config 已接受）：%v", name, err)
+		}
+	}
+	for _, name := range []string{"", "verbose", "trace", "DEBUG", "info "} {
+		cfg := Default()
+		cfg.Logs.Level = name
+		cfgErr := cfg.Validate()
+		_, runlogErr := runlog.ParseLevel(name)
+		if cfgErr == nil && runlogErr != nil {
+			t.Errorf("config 接受了 %q 但 runlog 拒絕：%v", name, runlogErr)
+		}
+		if cfgErr != nil && runlogErr == nil {
+			t.Errorf("runlog 接受了 %q 但 config 拒絕：%v", name, cfgErr)
+		}
+	}
+}
+
+// TestLogsRotationDefaults 固定日誌分檔與保留的內建值。
+//
+// retention_days 的預設是「不限制」，這是刻意的取向而不是遗漏：
+// 活動進行中自動刪掉日誌，等於在最需要線索的時候把線索清了。
+func TestLogsRotationDefaults(t *testing.T) {
+	cfg := Default()
+	if cfg.Logs.FilePrefix != "evernight-run" {
+		t.Errorf("預設前綴 = %q", cfg.Logs.FilePrefix)
+	}
+	if cfg.Logs.RetentionDays != 0 {
+		t.Errorf("預設保留天數 = %d，want 0（不限制）", cfg.Logs.RetentionDays)
+	}
+	if err := cfg.Validate(); err != nil {
+		t.Errorf("預設組態應通過校驗：%v", err)
+	}
+}
+
+func TestLogsFilePrefixValidation(t *testing.T) {
+	accepted := []struct{ in, want string }{
+		{"moe.yashi.run", "moe.yashi.run"}, // 含點合法：清理規則認得帶點前綴
+		{"  evernight-run  ", "evernight-run"},
+		{"", "evernight-run"}, // 留空回填內建預設
+	}
+	for _, tc := range accepted {
+		cfg := Default()
+		cfg.Logs.FilePrefix = tc.in
+		if err := cfg.Validate(); err != nil {
+			t.Errorf("前綴 %q 應被接受：%v", tc.in, err)
+			continue
+		}
+		if cfg.Logs.FilePrefix != tc.want {
+			t.Errorf("前綴 %q 正規化後 = %q，want %q", tc.in, cfg.Logs.FilePrefix, tc.want)
+		}
+	}
+
+	rejected := []string{
+		"a/b",
+		"a" + string(rune(0x5C)) + "b", // 反斜線以碼位寫：原始碼裡的跳脫最容易被工具吃掉一層
+		"..",
+		".",
+		"run:1",
+		"run*1",
+		`run"1`,
+		"run<1",
+		"run|1",
+		"run\n1",
+		strings.Repeat("r", 65),
+	}
+	for _, prefix := range rejected {
+		cfg := Default()
+		cfg.Logs.FilePrefix = prefix
+		if err := cfg.Validate(); err == nil {
+			t.Errorf("前綴 %q 應被拒絕（它會被直接拼成檔案名）", prefix)
+		}
+	}
+}
+
+func TestLogsRetentionDaysValidation(t *testing.T) {
+	for _, days := range []int{0, 1, 7, 3650} {
+		cfg := Default()
+		cfg.Logs.RetentionDays = days
+		if err := cfg.Validate(); err != nil {
+			t.Errorf("保留 %d 天應被接受：%v", days, err)
+		}
+	}
+	for _, days := range []int{-1, 3651, 100000} {
+		cfg := Default()
+		cfg.Logs.RetentionDays = days
+		if err := cfg.Validate(); err == nil {
+			t.Errorf("保留 %d 天應被拒絕", days)
+		}
+	}
+}
+
+// TestLogsEnvOverrides 驗證兩個新鍵都能由環境變數給定（開發與排錯時不改檔）。
+func TestLogsEnvOverrides(t *testing.T) {
+	t.Setenv("ER_LOGS_FILE_PREFIX", "er-prefix")
+	t.Setenv("ER_LOGS_RETENTION_DAYS", "14")
+	cfg, err := Load(Options{DataDir: t.TempDir()})
+	if err != nil {
+		t.Fatalf("Load 失敗：%v", err)
+	}
+	if cfg.Logs.FilePrefix != "er-prefix" {
+		t.Errorf("ER_LOGS_FILE_PREFIX 未生效：%q", cfg.Logs.FilePrefix)
+	}
+	if cfg.Logs.RetentionDays != 14 {
+		t.Errorf("ER_LOGS_RETENTION_DAYS 未生效：%d", cfg.Logs.RetentionDays)
+	}
+	// 摘要裡要看得見這兩個值：分檔與保留是部署狀態，不是實作細節。
+	summary := cfg.Redacted()
+	if !strings.Contains(summary, "logs_prefix=er-prefix") || !strings.Contains(summary, "logs_retention_days=14") {
+		t.Errorf("Redacted() 摘要缺少日誌分檔資訊：%s", summary)
+	}
+
+	t.Setenv("ER_LOGS_RETENTION_DAYS", "abc")
+	if _, err := Load(Options{DataDir: t.TempDir()}); err == nil {
+		t.Error("ER_LOGS_RETENTION_DAYS 非整數時應啟動失敗")
+	}
+}
+
+// TestExampleYAMLDocumentsLogKeys 確保範例組態把日誌的四個鍵都寫出來。
+//
+// 少了任何一個，部署者就只會看到「dir 與 level」，
+// 而「保留不限制」這件事必須在檔案裡寫明白，否則没人知道日誌會一直長。
+func TestExampleYAMLDocumentsLogKeys(t *testing.T) {
+	for _, want := range []string{"logs:", "dir:", "level:", "file_prefix:", "retention_days:"} {
+		if !strings.Contains(ExampleYAML, want) {
+			t.Errorf("ExampleYAML 缺少 %q", want)
+		}
+	}
+	if !strings.Contains(ExampleYAML, "不限制") {
+		t.Error("ExampleYAML 應說明 retention_days=0 的含義")
+	}
+	// 範例組態自己必須解得開：同一個鍵寫兩次時，YAML 解析器會在「第一次啟動生成的
+	// config.yaml 被讀回來」時才報錯——那已經是用戶的執行目錄，不是這支測試。
+	var fromExample Config
+	if err := yaml.Unmarshal([]byte(ExampleYAML), &fromExample); err != nil {
+		t.Fatalf("ExampleYAML 解析失敗（是否有重複鍵）：%v", err)
+	}
+	if fromExample.Logs.FilePrefix != Default().Logs.FilePrefix ||
+		fromExample.Logs.RetentionDays != Default().Logs.RetentionDays {
+		t.Errorf("ExampleYAML 的日誌鍵與內建預設不同：%+v", fromExample.Logs)
+	}
+	if fromExample.Server.Listen != Default().Server.Listen {
+		t.Errorf("ExampleYAML 的監聽地址與內建預設不同：%q", fromExample.Server.Listen)
+	}
 }

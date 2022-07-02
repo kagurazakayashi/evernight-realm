@@ -6,7 +6,6 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
-	"log"
 	"net/http"
 	"net/http/httptest"
 	"regexp"
@@ -35,7 +34,7 @@ func newDepsServer(t *testing.T, deps Deps) (*httptest.Server, *bytes.Buffer) {
 	cfg := config.Default()
 	srv := New(&cfg, testVersion, deps)
 	var logBuf bytes.Buffer
-	srv.logger = log.New(&logBuf, "", 0)
+	srv.logger = testLogger(&logBuf)
 	ts := httptest.NewServer(srv.Handler())
 	t.Cleanup(ts.Close)
 	return ts, &logBuf
@@ -132,7 +131,10 @@ func TestReadyReportsUnavailableAndStaysDesensitised(t *testing.T) {
 	if envelope.RequestID == "" || envelope.RequestID != resp.Header.Get(requestIDHeader) {
 		t.Errorf("未就緒回應仍須帶 request_id，實際 %q", envelope.RequestID)
 	}
-	if logged := logBuf.String(); !strings.Contains(logged, cause) || !strings.Contains(logged, envelope.RequestID) {
+	// 日誌裡的是「人類可讀那一份」：反斜線會被跳脫成 \\，因此逐字比對要改看關鍵片段，
+	// 原字逐字的內容由日誌檔案（JSON 那一份）負責，見 internal/runlog 的對應測試。
+	if logged := logBuf.String(); !strings.Contains(logged, "無法連線至") ||
+		!strings.Contains(logged, "SQLITE_BUSY") || !strings.Contains(logged, envelope.RequestID) {
 		t.Errorf("伺服器端日誌應含失敗原因與可對應的 request_id：%s", logged)
 	}
 	// 未就緒的回應仍然帶著完整安全標頭（中介層鏈最外層）。

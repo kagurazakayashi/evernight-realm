@@ -7,6 +7,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
@@ -63,7 +64,7 @@ func TestRunRefusesFutureSchemaVersionWithoutWriting(t *testing.T) {
 	}
 
 	out := &syncBuffer{}
-	err := run(context.Background(), func() {}, []string{"--data-dir", dir}, out)
+	err := run(context.Background(), func() {}, []string{"--data-dir", dir}, out, io.Discard)
 	if err == nil {
 		t.Fatal("較新版本的資料庫應使啟動失敗")
 	}
@@ -169,7 +170,7 @@ func TestRunWithIntegrityCheckAndSchemaGuardConfigured(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	runErr := make(chan error, 1)
-	go func() { runErr <- run(ctx, cancel, []string{"--data-dir", dir}, out) }()
+	go func() { runErr <- run(ctx, cancel, []string{"--data-dir", dir}, out, io.Discard) }()
 
 	addr := waitForListenAddr(t, out, runErr)
 	if addr == "" {

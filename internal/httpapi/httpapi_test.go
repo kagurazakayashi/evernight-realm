@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log/slog"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -13,9 +14,18 @@ import (
 	"time"
 
 	"github.com/kagurazakayashi/evernight-realm/internal/config"
+	"github.com/kagurazakayashi/evernight-realm/internal/runlog"
 )
 
 const testVersion = "0.1.0-test"
+
+// testLogger 建立把記錄以人類可讀格式寫入 w 的記錄器，內容一律經 runlog 的脫敏管線。
+//
+// 測試注入的是這個而不是「沒前綴的 log.New」：判準要與正式路徑相同，
+// 否則「日誌裡看不到憑據」這件事只在前端測試成立、在執行檔上不成立。
+func testLogger(w io.Writer) *slog.Logger {
+	return runlog.WriterLogger(w)
+}
 
 func testServer(t *testing.T) *httptest.Server {
 	t.Helper()

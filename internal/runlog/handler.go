@@ -10,6 +10,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/kagurazakayashi/evernight-realm/internal/redact"
 	"github.com/kagurazakayashi/evernight-realm/internal/timeutil"
 )
 
@@ -46,7 +47,7 @@ func (h *redactingHandler) Handle(ctx context.Context, r slog.Record) error {
 	if h.now != nil {
 		at = h.now().UTC()
 	}
-	out := slog.NewRecord(at, r.Level, RedactText(r.Message), r.PC)
+	out := slog.NewRecord(at, r.Level, redact.Text(r.Message), r.PC)
 	attrs := make([]slog.Attr, 0, r.NumAttrs())
 	r.Attrs(func(a slog.Attr) bool {
 		attrs = append(attrs, redactAttr(a, h.group))
@@ -110,10 +111,10 @@ func redactAttr(a slog.Attr, prefix string) slog.Attr {
 		}
 		return slog.Attr{Key: a.Key, Value: slog.GroupValue(out...)}
 	case slog.KindString:
-		return slog.String(a.Key, RedactValue(effective, a.Value.String()))
+		return slog.String(a.Key, redact.Value(effective, a.Value.String()))
 	case slog.KindAny:
 		// 任意型別（error、結構體）只能先壓成文字再遮罩：這正是值裡最常見到憑證的一條路。
-		return slog.String(a.Key, RedactText(fmt.Sprint(a.Value.Any())))
+		return slog.String(a.Key, redact.Text(fmt.Sprint(a.Value.Any())))
 	default:
 		return a
 	}

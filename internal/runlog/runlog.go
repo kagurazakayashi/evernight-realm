@@ -91,7 +91,7 @@ func Open(opts Options) (*Logger, error) {
 	if stderr == nil {
 		stderr = os.Stderr
 	}
-	// 檔案那份經 daySink 落地：它负责換日與保留淘汰，寫入器介面對 slog 來說是同一個 io.Writer。
+	// 檔案那份經 daySink 落地：它負責換日與保留淘汰，寫入器介面對 slog 來說是同一個 io.Writer。
 	sink, err := newDaySink(opts.Dir, prefix, opts.Location, opts.Now, opts.RetentionDays, stderr)
 	if err != nil {
 		return nil, fmt.Errorf("runlog: %w", err)
@@ -119,7 +119,7 @@ var illegalNameChars = map[rune]bool{
 
 // validateFilePrefix 檢查前綴能安全拼進檔案名（<前綴>.YYYY-MM-DD.log）。
 //
-// config 那边已有同樣的校驗；這裡再擋一次是因為 runlog 直接面对檔案系統，
+// config 那邊已有同樣的校驗；這裡再擋一次是因為 runlog 直接面對檔案系統，
 // 不能假設每個呼叫者都走過組態校驗（測試、日後的一次性命令都算直接呼叫者）。
 func validateFilePrefix(prefix string) error {
 	if prefix == "." || prefix == ".." {

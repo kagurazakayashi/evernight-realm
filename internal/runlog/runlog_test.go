@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"github.com/kagurazakayashi/evernight-realm/internal/redact"
 	"io"
 	"log"
 	"log/slog"
@@ -109,11 +110,11 @@ func TestRedactionAppliesToBothSinks(t *testing.T) {
 	if err := json.Unmarshal([]byte(lines[0]), &record); err != nil {
 		t.Fatal(err)
 	}
-	if record["password"] != RedactedValue {
-		t.Errorf("password = %v，want %q", record["password"], RedactedValue)
+	if record["password"] != redact.Redacted {
+		t.Errorf("password = %v，want %q", record["password"], redact.Redacted)
 	}
-	if ref, _ := record["session_token"].(string); !strings.HasPrefix(ref, RefPrefix) {
-		t.Errorf("session_token = %v，應改記為 %s 短辨識碼", record["session_token"], RefPrefix)
+	if ref, _ := record["session_token"].(string); !strings.HasPrefix(ref, redact.RefPrefix) {
+		t.Errorf("session_token = %v，應改記為 %s 短辨識碼", record["session_token"], redact.RefPrefix)
 	}
 	// user_agent 不是敏感欄位名，但值裡出現 JWT 形狀時仍要被打掉：
 	// 鍵名清單只擋得住「大家都知道該叫什麼」的欄位，標頭與錯誤訊息得靠值形狀。
@@ -121,7 +122,7 @@ func TestRedactionAppliesToBothSinks(t *testing.T) {
 	if strings.Contains(agent, "eyJhbGciOiJIUzI1NiJ9") {
 		t.Errorf("user_agent 裡的 JWT 未被遮罩：%q", agent)
 	}
-	if !strings.HasPrefix(agent, "curl/8.6 "+RefPrefix) {
+	if !strings.HasPrefix(agent, "curl/8.6 "+redact.RefPrefix) {
 		t.Errorf("user_agent 的非憑證部分被一起抹掉了：%q", agent)
 	}
 }
@@ -148,7 +149,7 @@ func TestMessageAndGroupsAreRedacted(t *testing.T) {
 	if !ok {
 		t.Fatalf("群組結構未保留（記錄變成 %v）", record)
 	}
-	if ref, _ := group["token"].(string); !strings.HasPrefix(ref, RefPrefix) {
+	if ref, _ := group["token"].(string); !strings.HasPrefix(ref, redact.RefPrefix) {
 		t.Errorf("session.token = %v，應改記為短辨識碼", group["token"])
 	}
 	if _, exists := group["session.token"]; exists {
@@ -262,7 +263,7 @@ func TestBoundAttrsAreRedacted(t *testing.T) {
 	const idLeak = "sess-9f8e7d6c5b4a3210fedcba"
 	logger.WithGroup("session").Info("群組綁定", "id", idLeak)
 	if strings.Contains(stderr.String(), idLeak) {
-		t.Errorf("session.id 應按 %s 短辨識碼記錄：%q", RefPrefix, stderr.String())
+		t.Errorf("session.id 應按 %s 短辨識碼記錄：%q", redact.RefPrefix, stderr.String())
 	}
 }
 

@@ -1,4 +1,14 @@
-package runlog
+// Package redact 實作 ER-SEC-001 §7 的日誌與記錄脫敏清單，是服務端唯一的實作點。
+//
+// 為什麼獨立成一個套件而不是留在 internal/runlog 裡：審計記錄（internal/audit）
+// 必須套用同一份規則，而存儲層不該為了遮罩去 import 日誌套件；兩邊各拷貝一份的結局，
+// 是改動其中一邊時建置不會失敗，只會讓另一邊悄悄漏掉遮罩。
+// 代碼裡的處置分類與 §7 的三大類一一對應：永不記錄、只留標識、以及無法歸屬鍵名時
+// 靠值形狀判斷的可疑憑證。
+//
+// 前端 `lib/core/diagnostics/redaction.dart`（DEC-021）是同一份清單的另一個實作
+// （語言不同、無法共用代碼）；兩邊有意圖的差異記在決策記錄 DEC-027。
+package redact
 
 import (
 	"hash/fnv"
@@ -11,10 +21,10 @@ import (
 // 日誌記號與上限：與前端 lib/core/diagnostics/redaction.dart 使用同一套佔標文字，
 // 兩邊實作的都是根倉庫 ER-SEC-001 §7 的日誌脫敏清單。
 const (
-	// RedactedValue 取代「永不記錄」欄位的值（鍵名保留，讓人看得出擋了什麼）。
-	RedactedValue = "[redacted]"
-	// MaskedValue 取代形狀可疑、但無法歸屬到任何鍵名的憑證值。
-	MaskedValue = "[masked]"
+	// Redacted 取代「永不記錄」欄位的值（鍵名保留，讓人看得出擋了什麼）。
+	Redacted = "[redacted]"
+	// Masked 取代形狀可疑、但無法歸屬到任何鍵名的憑證值。
+	Masked = "[masked]"
 	// RefPrefix 加上一段不可還原的短辨識碼，用於「只留標識」的欄位。
 	RefPrefix = "ref#"
 	// MaxValueRunes 是單個欄位值寫出前保留的上限（以字元計，非位元組）。
@@ -22,17 +32,17 @@ const (
 	MaxValueRunes = 600
 )
 
-// ValueAction 描述某個欄位名在日誌裡的處置方式。
-type ValueAction int
+// Action 描述某個欄位名在日誌裡的處置方式。
+type Action int
 
 // 處置方式枚舉：ER-SEC-001 §7 的三大類加上「一般欄位」。
 const (
-	// ActionKeep 是預設值：鍵名與值都不特別處理，仍要過值形狀掃描與截斷。
-	ActionKeep ValueAction = iota
-	// ActionRedact 表示值永不記錄，一律換成 RedactedValue。
-	ActionRedact
-	// ActionRef 表示值改記為 RefPrefix 加短辨識碼（同值穩定、不可還原）。
-	ActionRef
+	// Keep 是預設值：鍵名與值都不特別處理，仍要過值形狀掃描與截斷。
+	Keep Action = iota
+	// NeverRecord 表示值永不記錄，一律換成 Redacted。
+	NeverRecord
+	// KeepReference 表示值改記為 RefPrefix 加短辨識碼（同值穩定、不可還原）。
+	KeepReference
 )
 
 // keyActions 為「正規化欄位名 → 處置規則」的唯一清單。
@@ -40,72 +50,72 @@ const (
 // 鍵名先正規化（小寫並去掉底線、連字號、點與引號）再比對，因此 session_token、
 // Session-Token 與 session.token 會落到同一個判定上。一張表而非兩組集合：
 // 分成兩份時「同一個鍵名同時出現在兩組」這種矛盾不會讓建置失敗，只會讓其中一組失效。
-var keyActions = map[string]ValueAction{
+var keyActions = map[string]Action{
 	// 永不記錄：憑據本體（§7「密碼/PIN/恢復碼」「Root 憑據」「TLS 私鑰」）。
-	"password":         ActionRedact,
-	"passwd":           ActionRedact,
-	"pwd":              ActionRedact,
-	"pin":              ActionRedact,
-	"pintoken":         ActionRedact,
-	"recoverycode":     ActionRedact,
-	"recoverykey":      ActionRedact,
-	"passphrase":       ActionRedact,
-	"rootpassword":     ActionRedact,
-	"rootpasswordhash": ActionRedact,
-	"passwordhash":     ActionRedact,
-	"privatekey":       ActionRedact,
-	"tlskey":           ActionRedact,
-	"clientkey":        ActionRedact,
-	"secret":           ActionRedact,
-	"clientsecret":     ActionRedact,
-	"signingkey":       ActionRedact,
-	"certificate":      ActionRedact,
+	"password":         NeverRecord,
+	"passwd":           NeverRecord,
+	"pwd":              NeverRecord,
+	"pin":              NeverRecord,
+	"pintoken":         NeverRecord,
+	"recoverycode":     NeverRecord,
+	"recoverykey":      NeverRecord,
+	"passphrase":       NeverRecord,
+	"rootpassword":     NeverRecord,
+	"rootpasswordhash": NeverRecord,
+	"passwordhash":     NeverRecord,
+	"privatekey":       NeverRecord,
+	"tlskey":           NeverRecord,
+	"clientkey":        NeverRecord,
+	"secret":           NeverRecord,
+	"clientsecret":     NeverRecord,
+	"signingkey":       NeverRecord,
+	"certificate":      NeverRecord,
 
 	// 永不記錄：通訊正文（§7「私聊正文：記錄事件，預設不記錄正文」）。
 	// 這些鍵名本身就是「內容」的載體，值一律不進日誌；
 	// 要記錄的是事件（誰、對誰、何時），由呼叫端用別的欄位表達。
-	"message":        ActionRedact,
-	"messages":       ActionRedact,
-	"messagebody":    ActionRedact,
-	"messagecontent": ActionRedact,
-	"content":        ActionRedact,
-	"body":           ActionRedact,
-	"rawbody":        ActionRedact,
-	"requestbody":    ActionRedact,
-	"responsebody":   ActionRedact,
-	"postbody":       ActionRedact,
-	"text":           ActionRedact,
-	"chat":           ActionRedact,
-	"chatbody":       ActionRedact,
-	"chattext":       ActionRedact,
-	"chatmessage":    ActionRedact,
-	"privatechat":    ActionRedact,
-	"privatemessage": ActionRedact,
-	"dm":             ActionRedact,
-	"dmtext":         ActionRedact,
-	"payload":        ActionRedact,
-	"arguments":      ActionRedact,
+	"message":        NeverRecord,
+	"messages":       NeverRecord,
+	"messagebody":    NeverRecord,
+	"messagecontent": NeverRecord,
+	"content":        NeverRecord,
+	"body":           NeverRecord,
+	"rawbody":        NeverRecord,
+	"requestbody":    NeverRecord,
+	"responsebody":   NeverRecord,
+	"postbody":       NeverRecord,
+	"text":           NeverRecord,
+	"chat":           NeverRecord,
+	"chatbody":       NeverRecord,
+	"chattext":       NeverRecord,
+	"chatmessage":    NeverRecord,
+	"privatechat":    NeverRecord,
+	"privatemessage": NeverRecord,
+	"dm":             NeverRecord,
+	"dmtext":         NeverRecord,
+	"payload":        NeverRecord,
+	"arguments":      NeverRecord,
 
 	// 只留標識：令牌、Cookie、金鑰（§7「Session Token / Cookie 值」「QR Token」）。
-	"token":              ActionRef,
-	"accesstoken":        ActionRef,
-	"refreshtoken":       ActionRef,
-	"authtoken":          ActionRef,
-	"sessiontoken":       ActionRef,
-	"sessionid":          ActionRef,
-	"sid":                ActionRef,
-	"cookie":             ActionRef,
-	"setcookie":          ActionRef,
-	"authorization":      ActionRef,
-	"proxyauthorization": ActionRef,
-	"bearer":             ActionRef,
-	"csrftoken":          ActionRef,
-	"csrf":               ActionRef,
-	"apikey":             ActionRef,
-	"apitoken":           ActionRef,
-	"qrcode":             ActionRef,
-	"qrcodetoken":        ActionRef,
-	"idempotencykey":     ActionRef,
+	"token":              KeepReference,
+	"accesstoken":        KeepReference,
+	"refreshtoken":       KeepReference,
+	"authtoken":          KeepReference,
+	"sessiontoken":       KeepReference,
+	"sessionid":          KeepReference,
+	"sid":                KeepReference,
+	"cookie":             KeepReference,
+	"setcookie":          KeepReference,
+	"authorization":      KeepReference,
+	"proxyauthorization": KeepReference,
+	"bearer":             KeepReference,
+	"csrftoken":          KeepReference,
+	"csrf":               KeepReference,
+	"apikey":             KeepReference,
+	"apitoken":           KeepReference,
+	"qrcode":             KeepReference,
+	"qrcodetoken":        KeepReference,
+	"idempotencykey":     KeepReference,
 }
 
 // normalizeKey 正規化欄位名：小寫並去掉底線、連字號、點與兩種引號。
@@ -123,15 +133,15 @@ func normalizeKey(key string) string {
 	return strings.ToLower(b.String())
 }
 
-// ActionForKey 回傳欄位名的處置方式；未登記的鍵名為 ActionKeep。
+// ActionFor 回傳欄位名的處置方式；未登記的鍵名為 Keep。
 //
 // request_id 刻意不列在任何清單：它是關聯識別碼而非憑據，日誌與回應標頭都要能看見原值
 // （ER-SRS-001 §28「每個響應帶 request_id，便於本地日誌追蹤」）。
-func ActionForKey(key string) ValueAction {
+func ActionFor(key string) Action {
 	if action, ok := keyActions[normalizeKey(key)]; ok {
 		return action
 	}
-	return ActionKeep
+	return Keep
 }
 
 // 值形狀規則：沒有鍵名可依據的憑證（自由文字裡的 Bearer 頭、PEM 區塊、JWT⋯）
@@ -190,21 +200,21 @@ func isStructuralPathKey(key string) bool {
 	return structuralPathKeys[normalizeKey(key)]
 }
 
-// RedactText 遮罩自由文字中的憑證形狀並截斷長度，回傳可安全寫入日誌的文字。
+// Text 遮罩自由文字中的憑證形狀並截斷長度，回傳可安全寫入日誌的文字。
 //
 // 「自由文字」指錯誤訊息、panic 內容、堆疊、客戶端標頭等拿不到欄位名的場合：
 // 這裡先假設輸入含有敏感值，逐規則遮罩後才允許離開這層，
 // 而不是指望拋出例外的人記得避開。規則順序是先專後泛、最後才成對遮罩（見 redactShapes 註解）。
-func RedactText(text string) string {
+func Text(text string) string {
 	return truncate(redactShapes(text, true))
 }
 
-// RedactValue 依欄位名處置單個值；未登記的鍵名仍要過值形狀掃描。
-func RedactValue(key, value string) string {
-	switch ActionForKey(key) {
-	case ActionRedact:
-		return RedactedValue
-	case ActionRef:
+// Value 依欄位名處置單個值；未登記的鍵名仍要過值形狀掃描。
+func Value(key, value string) string {
+	switch ActionFor(key) {
+	case NeverRecord:
+		return Redacted
+	case KeepReference:
 		return RefPrefix + referenceOf(value)
 	default:
 		return truncate(redactShapes(value, !isStructuralPathKey(key)))
@@ -218,13 +228,13 @@ func RedactValue(key, value string) string {
 // 後面的成對掃描就看不見完整值了；反過來先成對再形狀則會把已判定安全的鍵值重複處理。
 // blobRules 為 false 時跳過最後三條長隨機串規則（只給路徑類鍵名，理由見 structuralPathKeys）。
 func redactShapes(text string, blobRules bool) string {
-	out := pemBlock.ReplaceAllStringFunc(text, func(string) string { return RedactedValue + "(private-key)" })
+	out := pemBlock.ReplaceAllStringFunc(text, func(string) string { return Redacted + "(private-key)" })
 	out = uriUserInfo.ReplaceAllStringFunc(out, func(match string) string {
 		separator := strings.Index(match, "://")
 		if separator < 0 {
-			return RedactedValue
+			return Redacted
 		}
-		return match[:separator+3] + RedactedValue + "@"
+		return match[:separator+3] + Redacted + "@"
 	})
 	out = schemeToken.ReplaceAllStringFunc(out, func(match string) string {
 		groups := schemeToken.FindStringSubmatch(match)
@@ -235,13 +245,13 @@ func redactShapes(text string, blobRules bool) string {
 	if !blobRules {
 		return out
 	}
-	out = longHex.ReplaceAllStringFunc(out, func(string) string { return MaskedValue })
-	out = paddedBase64.ReplaceAllStringFunc(out, func(string) string { return MaskedValue })
+	out = longHex.ReplaceAllStringFunc(out, func(string) string { return Masked })
+	out = paddedBase64.ReplaceAllStringFunc(out, func(string) string { return Masked })
 	out = longAlnum.ReplaceAllStringFunc(out, func(match string) string {
 		// 只要求「夠長 + 含數字」：全大寫的 API 金鑰很常見，要求含小寫會漏擋；
 		// 不含數字的長英數串通常是散列值以外的識別碼或程式文字，保留下來才排得動錯。
 		if strings.ContainsAny(match, "0123456789") {
-			return MaskedValue
+			return Masked
 		}
 		return match
 	})
@@ -267,12 +277,12 @@ func redactPairs(text string) string {
 		}
 		key := rest[matched[2]:matched[3]]
 		valueStart, valueEnd := cursor+matched[4], cursor+matched[5]
-		switch ActionForKey(key) {
-		case ActionRedact:
+		switch ActionFor(key) {
+		case NeverRecord:
 			b.WriteString(text[cursor:valueStart])
-			b.WriteString(RedactedValue)
+			b.WriteString(Redacted)
 			cursor = valueEnd
-		case ActionRef:
+		case KeepReference:
 			b.WriteString(text[cursor:valueStart])
 			b.WriteString(RefPrefix + referenceOf(text[valueStart:valueEnd]))
 			cursor = valueEnd
@@ -288,7 +298,7 @@ func redactPairs(text string) string {
 //
 // **這是關聯識別碼，不是安全摘要**：目的只是讓同一個憑證在日誌裡穩定對應同一個標記，
 // 而不把原值寫出來。FNV-1a 不是為抗逆像設計的，因此低熵值（例如 4 位數 PIN）
-// 一律走 ActionRedact 而非 ActionRef——清單裡把 PIN 歸在「永不記錄」正是這個理由。
+// 一律走 NeverRecord 而非 KeepReference——清單裡把 PIN 歸在「永不記錄」正是這個理由。
 func referenceOf(value string) string {
 	h := fnv.New64a()
 	_, _ = h.Write([]byte(value))
@@ -330,7 +340,7 @@ func SummarizeStack(stack string, maxLines int) string {
 	if dropped := countNonEmpty(lines) - len(kept); dropped > 0 {
 		suffix = " …（另有 " + strconv.Itoa(dropped) + " 行）"
 	}
-	return RedactText(strings.Join(kept, " ⏎ ") + suffix)
+	return Text(strings.Join(kept, " ⏎ ") + suffix)
 }
 
 // countNonEmpty 回傳非空行數（供 SummarizeStack 計算被省略的行數）。

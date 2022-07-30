@@ -1,4 +1,4 @@
-package runlog
+package redact
 
 import (
 	"strconv"
@@ -13,8 +13,8 @@ import (
 // 那一條規則就永遠不會命中——寫錯一個字元的代價是一道悄悄失效的屏蔽，而不是編譯失敗。
 func TestKeyActionsAreNormalized(t *testing.T) {
 	for key, action := range keyActions {
-		if action == ActionKeep {
-			t.Errorf("keyActions[%q] 不應出現 ActionKeep", key)
+		if action == Keep {
+			t.Errorf("keyActions[%q] 不應出現 Keep", key)
 		}
 		if got := normalizeKey(key); got != key {
 			t.Errorf("鍵名 %q 未正規化（正規化後為 %q），該規則永遠不會命中", key, got)
@@ -26,18 +26,18 @@ func TestKeyActionsAreNormalized(t *testing.T) {
 func TestActionForKeyNormalization(t *testing.T) {
 	writings := []string{"session_token", "Session-Token", "session.token", "sessionToken", `"sessiontoken"`, "SESSION_TOKEN"}
 	for _, writing := range writings {
-		if got := ActionForKey(writing); got != ActionRef {
-			t.Errorf("ActionForKey(%q) = %v，want ActionRef", writing, got)
+		if got := ActionFor(writing); got != KeepReference {
+			t.Errorf("ActionFor(%q) = %v，want KeepReference", writing, got)
 		}
 	}
-	if got := ActionForKey("password"); got != ActionRedact {
+	if got := ActionFor("password"); got != NeverRecord {
 		t.Errorf("password 應永不記錄，實際 %v", got)
 	}
 	// request_id 是關聯識別碼而非憑據：被遮住的話日誌就再也對應不回回應標頭。
-	if got := ActionForKey("request_id"); got != ActionKeep {
+	if got := ActionFor("request_id"); got != Keep {
 		t.Errorf("request_id 不應被遮罩，實際 %v", got)
 	}
-	if got := ActionForKey(""); got != ActionKeep {
+	if got := ActionFor(""); got != Keep {
 		t.Errorf("空鍵名不應命中任何規則，實際 %v", got)
 	}
 }
@@ -62,9 +62,9 @@ func TestRedactValueNeverRecorded(t *testing.T) {
 		"private_message":    "只有兩個人看得到的內容",
 	}
 	for key, value := range secrets {
-		got := RedactValue(key, value)
-		if got != RedactedValue {
-			t.Errorf("RedactValue(%q,…) = %q，want %q", key, got, RedactedValue)
+		got := Value(key, value)
+		if got != Redacted {
+			t.Errorf("Value(%q,…) = %q，want %q", key, got, Redacted)
 		}
 		if strings.Contains(got, value) {
 			t.Errorf("欄位 %q 的原值仍出現在輸出裡：%q", key, got)
@@ -80,17 +80,17 @@ func TestRedactValueReference(t *testing.T) {
 	}
 	for _, key := range keys {
 		value := "value-for-" + key + "-5geg8Q3wF7pL"
-		got := RedactValue(key, value)
+		got := Value(key, value)
 		if !strings.HasPrefix(got, RefPrefix) {
-			t.Errorf("RedactValue(%q,…) = %q，應以 %s 開頭", key, got, RefPrefix)
+			t.Errorf("Value(%q,…) = %q，應以 %s 開頭", key, got, RefPrefix)
 		}
 		if strings.Contains(got, value) {
 			t.Errorf("欄位 %q 的原值仍出現在輸出裡：%q", key, got)
 		}
-		if again := RedactValue(key, value); again != got {
+		if again := Value(key, value); again != got {
 			t.Errorf("同一值兩次標識不同：%q 對 %q", got, again)
 		}
-		if other := RedactValue(key, value+"X"); other == got {
+		if other := Value(key, value+"X"); other == got {
 			t.Errorf("不同值得到同一標識：%q", got)
 		}
 	}
@@ -111,7 +111,7 @@ func TestRedactTextShapes(t *testing.T) {
 		{"URI 內嵌憑據", "開啟 postgres://admin:sup3rsecretpw@10.0.0.5:5432/db 失敗"},
 	}
 	for _, tc := range cases {
-		got := RedactText(tc.input)
+		got := Text(tc.input)
 		if got == tc.input {
 			t.Errorf("%s：未被遮罩：%q", tc.name, got)
 		}
@@ -140,13 +140,13 @@ func TestRedactTextPairsWithoutKey(t *testing.T) {
 		{"大標頭寫法", "Request header Cookie: sid=abc123def456 rejected", "abc123def456"},
 	}
 	for _, tc := range cases {
-		got := RedactText(tc.input)
+		got := Text(tc.input)
 		if strings.Contains(got, tc.leak) {
 			t.Errorf("%s：值 %q 未被遮罩：%q", tc.name, tc.leak, got)
 		}
 	}
 	// 鍵名要留下來：擋住值之後還得知道擋住的是哪個欄位，否則排錯只能靠猜。
-	if got := RedactText("password=hunter2"); !strings.Contains(got, "password") {
+	if got := Text("password=hunter2"); !strings.Contains(got, "password") {
 		t.Errorf("鍵名不應一起消失：%q", got)
 	}
 }
@@ -172,7 +172,7 @@ func TestRedactTextKeepsDiagnostics(t *testing.T) {
 		"版本 0 → 1（0001_server_settings）",
 	}
 	for _, input := range kept {
-		if got := RedactText(input); got != input {
+		if got := Text(input); got != input {
 			t.Errorf("不應被改動：\n  輸入 %q\n  輸出 %q", input, got)
 		}
 	}
@@ -181,7 +181,7 @@ func TestRedactTextKeepsDiagnostics(t *testing.T) {
 // TestTruncateRunesNotBytes 驗證截斷以字元計且不切出半個 UTF-8 序列。
 func TestTruncateRunesNotBytes(t *testing.T) {
 	long := strings.Repeat("日", MaxValueRunes+50)
-	got := RedactText(long)
+	got := Text(long)
 	if utf8.RuneCountInString(got) != MaxValueRunes+1 {
 		t.Errorf("截斷後的字元數 = %d，want %d", utf8.RuneCountInString(got), MaxValueRunes+1)
 	}
@@ -192,7 +192,7 @@ func TestTruncateRunesNotBytes(t *testing.T) {
 		t.Error("截斷後出現非法 UTF-8 序列")
 	}
 	short := strings.Repeat("日", MaxValueRunes)
-	if got := RedactText(short); got != short {
+	if got := Text(short); got != short {
 		t.Errorf("恰好等於上限的長度不應被截斷，實際長度 %d", utf8.RuneCountInString(got))
 	}
 	// 刻意不用連續的 a-f 做這半段：600 個 a 是合法的長十六進位形狀，
@@ -206,7 +206,7 @@ func TestTruncateRunesNotBytes(t *testing.T) {
 // 而前 600 字元裡的憑證卻原樣留下。
 func TestMaskBeforeTruncate(t *testing.T) {
 	value := strings.Repeat("x", 590) + " password=hunter2" + strings.Repeat("y", 500)
-	got := RedactText(value)
+	got := Text(value)
 	if strings.Contains(got, "hunter2") {
 		t.Error("值在截斷點之前的憑證未被遮罩")
 	}
@@ -246,26 +246,26 @@ func TestSummarizeStack(t *testing.T) {
 // 「資料庫開啟失敗」這條記錄就再也說不出是哪個目錄壞了。
 func TestStructuralPathKeysKeepPaths(t *testing.T) {
 	dir := `C:\Users\yashi\AppData\Local\Temp\2\TestRunWritesStructuredRunLog284736102\001`
-	if got := RedactValue("data_dir", dir); got != dir {
+	if got := Value("data_dir", dir); got != dir {
 		t.Errorf("data_dir 被誤傷：%q", got)
 	}
-	if got := RedactValue("database", `D:\evernight-data\backup-20260926T123456Z\evernight.db`); strings.Contains(got, MaskedValue) {
+	if got := Value("database", `D:\evernight-data\backup-20260926T123456Z\evernight.db`); strings.Contains(got, Masked) {
 		t.Errorf("database 路徑被誤傷：%q", got)
 	}
 
 	// 免除的只有長隨機串三條；路徑裡出現真正不該存在的東西仍然擋。
-	if got := RedactValue("data_dir", `D:\downloads\Bearer abcdef1234567890`); strings.Contains(got, "abcdef1234567890") {
+	if got := Value("data_dir", `D:\downloads\Bearer abcdef1234567890`); strings.Contains(got, "abcdef1234567890") {
 		t.Errorf("路徑值裡的認證方案未被遮罩：%q", got)
 	}
 
 	// URL 路徑不在免除清單內：QR 令牌正是會出現在路徑上的憑證。
 	const qr = "9f8e7d6c5b4a3210fedcba76543210"
-	if got := RedactValue("path", "/qr/"+qr); strings.Contains(got, qr) {
+	if got := Value("path", "/qr/"+qr); strings.Contains(got, qr) {
 		t.Errorf("URL 路徑裡的令牌形狀未被遮罩：%q", got)
 	}
 
 	// 訊息與自由文字一律走完整規則（沒有鍵名可依據）。
-	if got := RedactText(dir + " 建立失敗"); !strings.Contains(got, MaskedValue) {
+	if got := Text(dir + " 建立失敗"); !strings.Contains(got, Masked) {
 		t.Errorf("自由文字未套用長隨機串規則：%q", got)
 	}
 }
@@ -286,7 +286,7 @@ func TestReferenceOfFixedWidth(t *testing.T) {
 		}
 	}
 	// 走完整管線也要活著（這條路徑是記錄寫入時真的會走到的）。
-	if got := RedactValue("session_token", "a"); !strings.HasPrefix(got, RefPrefix) || len(got) != len(RefPrefix)+7 {
+	if got := Value("session_token", "a"); !strings.HasPrefix(got, RefPrefix) || len(got) != len(RefPrefix)+7 {
 		t.Errorf("短令牌的記錄形狀不符：%q", got)
 	}
 }

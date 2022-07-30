@@ -31,7 +31,7 @@ var ErrSinkClosed = errors.New("runlog: 日誌寫入器已關閉")
 // LogFileName 回傳指定時刻所屬自然日使用的檔案名（<前綴>.<YYYY-MM-DD>.log）。
 //
 // 日粒度由 loc 決定：本協議的時間戳一律 UTC（DEC-015），但「這天的日誌」是部署者的生活經驗，
-// 因此分檔跟的是顯示時區，记录内容仍是 UTC——兩者不對齊是刻意且已寫進文件的事實。
+// 因此分檔跟的是顯示時區，記錄內容仍是 UTC——兩者不對齊是刻意且已寫進文件的事實。
 func LogFileName(prefix string, at time.Time, loc *time.Location) string {
 	if prefix == "" {
 		prefix = DefaultFilePrefix
